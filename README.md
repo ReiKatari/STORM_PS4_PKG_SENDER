@@ -1,5 +1,4 @@
 # STORM PS4 PKG SENDER
----
 
 ### 🇷🇺 Особенности программы (Russian)
 
