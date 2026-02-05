@@ -3,6 +3,13 @@
 <img width="300" height="300" alt="image" src="https://github.com/user-attachments/assets/7718fe8d-e9d0-4874-a93f-f724534fe80e" />
 
 # STORM PS4 PKG SENDER
+
+**Многофункциональный инструмент для быстрой установки PKG-файлов на PlayStation 4 по сети, включающий полноценный FTP-браузер, менеджер установленных приложений и встроенную утилиту для автоматического бэкпорта игр под старые прошивки.**
+
+[![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://python.org)
+[![PyQt6](https://img.shields.io/badge/PyQt6-6.0+-green.svg)](https://pypi.org/project/PyQt6/)
+[![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 </div>
 
 ### 🇷🇺 Особенности программы (Russian)
@@ -37,6 +44,10 @@
 28. **🖱️ Контекстное меню:** Быстрые действия по клику правой кнопкой (открыть папку, удалить из списка, закрепить).
 29. **🔗 Keep-Alive соединение:** Поддержание активной сессии для стабильной передачи больших файлов.
 30. **⚙️ Сохранение настроек:** Запоминание геометрии окна, путей, IP и ширины колонок между запусками.
+31. **🛠️ Авто-Бэкпорт:** Автоматическое понижение версии (бэкпорт) для небольших обновлений (<1MB) под выбранную прошивку.
+32. **⚙️ Выбор прошивки:** Диалог выбора целевой версии ПО (5.05 - 11.00) для обеспечения совместимости.
+33. **📂 Улучшенный FTP:** Сортировка папок, предпросмотр изображений и управление файлами (переименование, создание папок) прямо в браузере.
+
 <img width="1914" height="1050" alt="image" src="https://github.com/user-attachments/assets/ee17a2be-9849-47ea-b46e-d7ad45fcd8b3" />
 
 ---
@@ -73,4 +84,6 @@
 28. **🖱️ Context Menu:** Quick actions via right-click (open folder, remove from list, pin).
 29. **🔗 Keep-Alive Connection:** Maintains an active session for stable transfer of large files.
 30. **⚙️ Settings Persistence:** Remembers window geometry, paths, IP, and column widths between sessions.
-<img width="1907" height="1055" alt="image" src="https://github.com/user-attachments/assets/93b7dd37-63e8-404c-84f6-e7ab2413cb16" />
+31. **🛠️ Auto-Backport:** Automatic backporting of small update files (<1MB) for the selected firmware.
+32. **⚙️ Firmware Selector:** Startup dialog to select target firmware version (5.05 - 11.00) for compatibility.
+33. **📂 Enhanced FTP:** Improved browser with folder sorting, image preview, and file management (rename, new folder).
