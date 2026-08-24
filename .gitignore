@@ -1,0 +1,14 @@
+bin/
+obj/
+*.user
+*.suo
+.vs/
+node_modules/
+target/
+dist/*.zip
+dist/*.rar
+dist/*.7z
+__pycache__/
+*.pyc
+.gradle/
+build/
