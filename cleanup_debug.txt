@@ -1,0 +1,10 @@
+[2026-02-06 00:55:28.905256] === EXIT CLEANUP START (Standalone) ===
+[2026-02-06 00:55:28.905256] Setting 'cleanup_backports': True
+[2026-02-06 00:55:28.905256] Mode: SCRIPT. Path: F:\MY SOFT\STORM PS4 PKG SENDER (Github)\stormps4pkgsender.py
+[2026-02-06 00:55:28.905256] Calculated Drive Root: F:
+[2026-02-06 00:55:28.905256] Target Cleanup Path: F:\STORM_BP_TEMP
+[2026-02-06 00:55:28.905759] os.path.exists check = True
+[2026-02-06 00:55:28.905759] Folder FOUND. Attempting delete...
+[2026-02-06 00:55:28.924273] RMtree Attempt 1
+[2026-02-06 00:55:29.030761] Success! Folder deleted.
+[2026-02-06 00:55:29.030761] === EXIT CLEANUP END ===
