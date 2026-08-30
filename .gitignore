@@ -41,3 +41,19 @@ Desktop.ini
 *.log
 *.tmp
 node_modules/
+
+
+# STORM SOFT Security & Large File Shield
+.env
+.env.*
+*credential*.json
+*secret*
+*.pfx
+*.cer
+*.key
+deepseek_key.txt
+google-credentials.json
+installer/Output/
+*.tmp*
+*.wal
+
