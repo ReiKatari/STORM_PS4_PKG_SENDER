@@ -21,14 +21,32 @@ gar_data/
 *.pfx
 *.cer
 
-# Keep tools in STORM SWITCH BOX if needed
+# Keep tools in STORM PS4 PKG SENDER
 !tools/**/*.exe
 !tools/**/*.dll
 
-# Keep branding icons
+# Keep branding icons and graphics
 !Files/*.ico
 !Files/*.png
 !Files/*.svg
+!*.ico
+!*.png
+!*.jpg
+
+# Python cache & logs
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+*.log*
+cleanup_debug.txt
+crash.log
+pkg_extraction.log
+
+# External third-party modding packs
+PS4_RipKit*
+PkgToolBox*
 
 # IDE & Environment
 .vs/
@@ -38,10 +56,9 @@ gar_data/
 *.user
 Thumbs.db
 Desktop.ini
-*.log
 *.tmp
+*.tmp*
 node_modules/
-
 
 # STORM SOFT Security & Large File Shield
 .env
@@ -54,6 +71,4 @@ node_modules/
 deepseek_key.txt
 google-credentials.json
 installer/Output/
-*.tmp*
 *.wal
-
