@@ -88,9 +88,33 @@ Copy-Item $cerRoot $cerInstaller -Force
 Copy-Item $cerRoot $cerOutput -Force
 Copy-Item $cerRoot (Join-Path $assemblingDir "STORM_Certificate.cer") -Force
 
+function Invoke-SignBinary([string]$filePath) {
+    if (-not (Test-Path $filePath)) { return }
+    $signed = $false
+    if ($signtool -and (Test-Path $signtool)) {
+        foreach ($ts in @("http://timestamp.digicert.com", "http://timestamp.sectigo.com", "http://timestamp.comodoca.com")) {
+            try {
+                & $signtool sign /fd SHA256 /tr $ts /td SHA256 /d "$appDisplayName $appVersion" /du "https://github.com/ReiKatari/STORM_PS4_PKG_SENDER" /sha1 $certThumb $filePath 2>&1 | Out-Null
+                if ($LASTEXITCODE -eq 0) {
+                    $signed = $true
+                    break
+                }
+            } catch { }
+        }
+    }
+    if (-not $signed) {
+        try {
+            Set-AuthenticodeSignature -FilePath $filePath -Certificate $cert -HashAlgorithm SHA256 -TimestampServer "http://timestamp.digicert.com" | Out-Null
+        } catch {
+            Set-AuthenticodeSignature -FilePath $filePath -Certificate $cert -HashAlgorithm SHA256 | Out-Null
+        }
+    }
+    Unblock-File -Path $filePath -ErrorAction SilentlyContinue
+}
+
 # Sign app binary
-Set-AuthenticodeSignature -FilePath (Join-Path $assemblingDir $appExeName) -Certificate $cert -HashAlgorithm SHA256 | Out-Null
-Set-AuthenticodeSignature -FilePath $distExe -Certificate $cert -HashAlgorithm SHA256 | Out-Null
+Invoke-SignBinary (Join-Path $assemblingDir $appExeName)
+Invoke-SignBinary $distExe
 
 # Package portable zip
 Write-Host "  -> Packaging Portable ZIP..." -ForegroundColor Yellow
@@ -120,23 +144,19 @@ if (-not (Test-Path $publishedInstaller)) {
 Copy-Item $publishedInstaller $setupExePath -Force
 Copy-Item $publishedInstaller $outputSetupExePath -Force
 
-# Sign Installers
-Set-AuthenticodeSignature -FilePath $setupExePath -Certificate $cert -HashAlgorithm SHA256 | Out-Null
-Set-AuthenticodeSignature -FilePath $outputSetupExePath -Certificate $cert -HashAlgorithm SHA256 | Out-Null
+# Sign Installers with signtool and RFC 3161 timestamp
+Invoke-SignBinary $setupExePath
+Invoke-SignBinary $outputSetupExePath
 
 # Register in User and Machine Root and TrustedPublisher stores silently
 try {
-    $certObj = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($cerRoot)
-    foreach ($loc in @([System.Security.Cryptography.X509Certificates.StoreLocation]::LocalMachine, [System.Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser)) {
-        foreach ($name in @([System.Security.Cryptography.X509Certificates.StoreName]::Root, [System.Security.Cryptography.X509Certificates.StoreName]::TrustedPublisher, [System.Security.Cryptography.X509Certificates.StoreName]::AuthRoot, [System.Security.Cryptography.X509Certificates.StoreName]::CertificateAuthority)) {
-            try {
-                $st = New-Object System.Security.Cryptography.X509Certificates.X509Store($name, $loc)
-                $st.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
-                $st.Add($certObj)
-                $st.Close()
-            } catch { }
-        }
-    }
+    Import-Certificate -FilePath $cerRoot -CertStoreLocation "Cert:\CurrentUser\TrustedPublisher" -ErrorAction SilentlyContinue | Out-Null
+    Import-Certificate -FilePath $cerRoot -CertStoreLocation "Cert:\CurrentUser\Root" -ErrorAction SilentlyContinue | Out-Null
+    Import-Certificate -FilePath $cerRoot -CertStoreLocation "Cert:\LocalMachine\TrustedPublisher" -ErrorAction SilentlyContinue | Out-Null
+    Import-Certificate -FilePath $cerRoot -CertStoreLocation "Cert:\LocalMachine\Root" -ErrorAction SilentlyContinue | Out-Null
+
+    Start-Process -FilePath "certutil.exe" -ArgumentList "-addstore -f Root `"$cerRoot`"" -WindowStyle Hidden -Wait -ErrorAction SilentlyContinue
+    Start-Process -FilePath "certutil.exe" -ArgumentList "-addstore -f TrustedPublisher `"$cerRoot`"" -WindowStyle Hidden -Wait -ErrorAction SilentlyContinue
 } catch { }
 
 # Step 5: Unblock output files

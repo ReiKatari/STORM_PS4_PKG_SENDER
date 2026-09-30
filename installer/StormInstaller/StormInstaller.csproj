@@ -15,6 +15,7 @@
     <Title>STORM PS4 PKG SENDER 1.4.0</Title>
     <Description>STORM PS4 PKG SENDER 1.4.0</Description>
     <Company>STORM TEAM</Company>
+    <PublisherName>STORM TEAM</PublisherName>
     <Authors>ReiKatari and STORM TEAM</Authors>
     <Copyright>Copyright © STORM TEAM 2026</Copyright>
     <ApplicationManifest>app.manifest</ApplicationManifest>

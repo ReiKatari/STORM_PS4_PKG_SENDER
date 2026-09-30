@@ -633,23 +633,27 @@ namespace StormUniversal.Installer
                 {
                     try
                     {
-                        // Запуск через explorer.exe гарантирует нормальный (неповышенный) уровень привилегий (Medium IL),
-                        // что полностью исключает блокировку Drag-and-Drop механизмом UIPI в Windows
-                        Process.Start(new ProcessStartInfo
-                        {
-                            FileName = "explorer.exe",
-                            Arguments = $"\"{targetExe}\"",
-                            UseShellExecute = true
-                        });
-                    }
-                    catch
-                    {
                         Process.Start(new ProcessStartInfo
                         {
                             FileName = targetExe,
                             WorkingDirectory = targetDir,
                             UseShellExecute = true
                         });
+                    }
+                    catch
+                    {
+                        try
+                        {
+                            Process.Start(new ProcessStartInfo
+                            {
+                                FileName = "cmd.exe",
+                                Arguments = $"/c start \"\" \"{targetExe}\"",
+                                WorkingDirectory = targetDir,
+                                CreateNoWindow = true,
+                                UseShellExecute = false
+                            });
+                        }
+                        catch { }
                     }
                 }
 
@@ -800,37 +804,140 @@ namespace StormUniversal.Installer
             catch { }
         }
 
+        private void CreateSingleShortcut(dynamic? shell, string shortcutPath, string targetExe, string targetDir, string iconLocation, string description)
+        {
+            try
+            {
+                string? parent = Path.GetDirectoryName(shortcutPath);
+                if (!string.IsNullOrEmpty(parent) && !Directory.Exists(parent))
+                {
+                    Directory.CreateDirectory(parent);
+                }
+
+                if (shell != null)
+                {
+                    try
+                    {
+                        dynamic sc = shell.CreateShortcut(shortcutPath);
+                        sc.TargetPath = targetExe;
+                        sc.WorkingDirectory = targetDir;
+                        sc.IconLocation = iconLocation;
+                        sc.Description = description;
+                        sc.Save();
+                        if (File.Exists(shortcutPath)) return;
+                    }
+                    catch { }
+                }
+
+                // Fallback via PowerShell WScript.Shell
+                string escapedSc = shortcutPath.Replace("'", "''");
+                string escapedTarget = targetExe.Replace("'", "''");
+                string escapedDir = targetDir.Replace("'", "''");
+                string escapedIcon = iconLocation.Replace("'", "''");
+                string escapedDesc = description.Replace("'", "''");
+                string psCmd = $"$s = New-Object -ComObject WScript.Shell; $sc = $s.CreateShortcut('{escapedSc}'); $sc.TargetPath = '{escapedTarget}'; $sc.WorkingDirectory = '{escapedDir}'; $sc.IconLocation = '{escapedIcon}'; $sc.Description = '{escapedDesc}'; $sc.Save();";
+                var psi = new ProcessStartInfo
+                {
+                    FileName = "powershell.exe",
+                    Arguments = $"-NoProfile -NonInteractive -WindowStyle Hidden -Command \"{psCmd}\"",
+                    CreateNoWindow = true,
+                    UseShellExecute = false
+                };
+                using var p = Process.Start(psi);
+                p?.WaitForExit(3000);
+            }
+            catch { }
+        }
+
         private void CreateShortcuts(string targetDir, string targetExe, string targetIco, bool desktopShortcut, bool startMenuShortcut)
         {
             try
             {
-                Type? shellType = Type.GetTypeFromProgID("WScript.Shell");
-                if (shellType == null) return;
-                dynamic? shell = Activator.CreateInstance(shellType);
-                if (shell == null) return;
+                dynamic? shell = null;
+                try
+                {
+                    Type? shellType = Type.GetTypeFromProgID("WScript.Shell");
+                    if (shellType != null)
+                    {
+                        shell = Activator.CreateInstance(shellType);
+                    }
+                }
+                catch { }
 
-                // Start Menu shortcut
+                string iconLocation = (File.Exists(targetIco) ? targetIco : targetExe) + ",0";
+
+                // Start Menu shortcuts (User + Common)
                 if (startMenuShortcut)
                 {
-                    string startMenu = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Programs), $"{AppDisplayName}.lnk");
-                    dynamic shortcut = shell.CreateShortcut(startMenu);
-                    shortcut.TargetPath = targetExe;
-                    shortcut.WorkingDirectory = targetDir;
-                    shortcut.IconLocation = (File.Exists(targetIco) ? targetIco : targetExe) + ",0";
-                    shortcut.Description = AppDisplayName;
-                    shortcut.Save();
+                    var startMenuPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+                    string p1 = Environment.GetFolderPath(Environment.SpecialFolder.Programs);
+                    if (!string.IsNullOrEmpty(p1)) startMenuPaths.Add(p1);
+
+                    string p2 = Environment.GetFolderPath(Environment.SpecialFolder.CommonPrograms);
+                    if (!string.IsNullOrEmpty(p2)) startMenuPaths.Add(p2);
+
+                    try
+                    {
+                        using var key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders");
+                        var val = key?.GetValue("Programs")?.ToString();
+                        if (!string.IsNullOrEmpty(val))
+                        {
+                            startMenuPaths.Add(Environment.ExpandEnvironmentVariables(val));
+                        }
+                    }
+                    catch { }
+
+                    string userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                    if (!string.IsNullOrEmpty(userProfile))
+                    {
+                        string fallback = Path.Combine(userProfile, @"AppData\Roaming\Microsoft\Windows\Start Menu\Programs");
+                        startMenuPaths.Add(fallback);
+                    }
+
+                    foreach (var dir in startMenuPaths)
+                    {
+                        if (string.IsNullOrWhiteSpace(dir)) continue;
+                        string lnk = Path.Combine(dir, $"{AppDisplayName}.lnk");
+                        CreateSingleShortcut(shell, lnk, targetExe, targetDir, iconLocation, AppDisplayName);
+                    }
                 }
 
-                // Desktop shortcut
+                // Desktop shortcuts (User + Public Common Desktop)
                 if (desktopShortcut)
                 {
-                    string desktop = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), $"{AppDisplayName}.lnk");
-                    dynamic deskShortcut = shell.CreateShortcut(desktop);
-                    deskShortcut.TargetPath = targetExe;
-                    deskShortcut.WorkingDirectory = targetDir;
-                    deskShortcut.IconLocation = (File.Exists(targetIco) ? targetIco : targetExe) + ",0";
-                    deskShortcut.Description = AppDisplayName;
-                    deskShortcut.Save();
+                    var desktopPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+                    string d1 = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
+                    if (!string.IsNullOrEmpty(d1)) desktopPaths.Add(d1);
+
+                    string d2 = Environment.GetFolderPath(Environment.SpecialFolder.CommonDesktopDirectory);
+                    if (!string.IsNullOrEmpty(d2)) desktopPaths.Add(d2);
+
+                    try
+                    {
+                        using var key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders");
+                        var val = key?.GetValue("Desktop")?.ToString();
+                        if (!string.IsNullOrEmpty(val))
+                        {
+                            desktopPaths.Add(Environment.ExpandEnvironmentVariables(val));
+                        }
+                    }
+                    catch { }
+
+                    string userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                    if (!string.IsNullOrEmpty(userProfile))
+                    {
+                        string fallback = Path.Combine(userProfile, "Desktop");
+                        desktopPaths.Add(fallback);
+                    }
+
+                    foreach (var dir in desktopPaths)
+                    {
+                        if (string.IsNullOrWhiteSpace(dir)) continue;
+                        string lnk = Path.Combine(dir, $"{AppDisplayName}.lnk");
+                        CreateSingleShortcut(shell, lnk, targetExe, targetDir, iconLocation, AppDisplayName);
+                    }
                 }
             }
             catch { }
