@@ -25,26 +25,25 @@ $setupExeName = "STORM_PS4_PKG_SENDER_${appVersion}_Setup.exe"
 $setupExePath = Join-Path $filesDir $setupExeName
 $outputSetupExePath = Join-Path $outputDir $setupExeName
 $portableZipPath = Join-Path $outputDir "STORM_PS4_PKG_SENDER_${appVersion}_win-x64.zip"
-$bundleZipPath = Join-Path $outputDir "STORM_PS4_PKG_SENDER_${appVersion}_Setup_Bundle.zip"
 
 # Step 0: Terminate running instances
-Write-Host "[0/6] Closing running instances to release file locks..." -ForegroundColor Yellow
+Write-Host "[0/5] Closing running instances to release file locks..." -ForegroundColor Yellow
 cmd.exe /c "taskkill /F /IM ""$appExeName"" /T >nul 2>&1"
 cmd.exe /c "taskkill /F /IM StormInstaller.exe /T >nul 2>&1"
 Get-Process "STORM PS4 PKG SENDER", "stormps4pkgsender", "StormInstaller", "XamlCompiler", "VBCSCompiler", "msbuild" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 Start-Sleep -Seconds 1
 
 # Step 1: Clean build outputs
-Write-Host "[1/6] Cleaning build directories..." -ForegroundColor Yellow
+Write-Host "[1/5] Cleaning build directories..." -ForegroundColor Yellow
 if (Test-Path "$installerProjDir\bin") { Remove-Item "$installerProjDir\bin" -Recurse -Force -ErrorAction SilentlyContinue }
 if (Test-Path "$installerProjDir\obj") { Remove-Item "$installerProjDir\obj" -Recurse -Force -ErrorAction SilentlyContinue }
 if (Test-Path $assemblingDir) { Remove-Item $assemblingDir -Recurse -Force -ErrorAction SilentlyContinue }
 if (Test-Path $portableZipPath) { Remove-Item $portableZipPath -Force -ErrorAction SilentlyContinue }
-if (Test-Path $bundleZipPath) { Remove-Item $bundleZipPath -Force -ErrorAction SilentlyContinue }
 if (Test-Path $outputSetupExePath) { Remove-Item $outputSetupExePath -Force -ErrorAction SilentlyContinue }
+Get-ChildItem -Path $filesDir, $outputDir -Filter "*Bundle*.zip" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
 
 # Step 2: Assemble Application payload
-Write-Host "[2/6] Preparing Application payload in Assembling folder..." -ForegroundColor Yellow
+Write-Host "[2/5] Preparing Application payload in Assembling folder..." -ForegroundColor Yellow
 if (-not (Test-Path $assemblingDir)) { New-Item -ItemType Directory -Path $assemblingDir | Out-Null }
 
 $distExe = Join-Path $baseDir "dist\$appExeName"
@@ -57,22 +56,20 @@ Copy-Item (Join-Path $baseDir "AppIcon.ico") (Join-Path $assemblingDir "AppIcon.
 Copy-Item (Join-Path $baseDir "AppIcon.ico") (Join-Path $assemblingDir "app.ico") -Force
 
 # Step 3: Digital Signature with STORM Authenticode Certificate + RFC 3161 Timestamp
-Write-Host "[3/6] Applying digital signature (STORM Authenticode SHA-256 + RFC 3161)..." -ForegroundColor Yellow
+Write-Host "[3/5] Applying digital signature (STORM Authenticode SHA-256 + RFC 3161)..." -ForegroundColor Yellow
 $signtool = (Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | Select-Object -First 1).FullName
 $tsUrl = "http://timestamp.digicert.com"
 
 $store = New-Object System.Security.Cryptography.X509Certificates.X509Store([System.Security.Cryptography.X509Certificates.StoreName]::My, [System.Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser)
 $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadOnly)
 
-$cert = $store.Certificates | Where-Object { $_.HasPrivateKey -and $_.Subject -like "*STORM TEAM*" } | Select-Object -First 1
+$cert = $store.Certificates | Where-Object { $_.HasPrivateKey -and $_.Subject -like "*CN=STORM TEAM*" } | Select-Object -First 1
 if (-not $cert) {
-    $cert = $store.Certificates | Where-Object { $_.HasPrivateKey -and $_.Subject -like "*CN=STORM Software*" } | Select-Object -First 1
+    $cert = $store.Certificates | Where-Object { $_.HasPrivateKey -and $_.Subject -like "*STORM TEAM*" } | Select-Object -First 1
 }
 if (-not $cert) {
-    $cert = $store.Certificates | Where-Object { $_.HasPrivateKey -and ($_.Subject -like "*STORM SOFT*" -or $_.Subject -like "*STORM*") } | Select-Object -First 1
-}
-if (-not $cert) {
-    $cert = $store.Certificates | Where-Object { $_.HasPrivateKey } | Select-Object -First 1
+    $store.Close()
+    throw "Error: Certificate for STORM TEAM not found in Cert:\CurrentUser\My!"
 }
 $store.Close()
 
@@ -110,7 +107,7 @@ Copy-Item $portableZipPath (Join-Path $outputDir "STORM_PS4_PKG_SENDER_${appVers
 Copy-Item $portableZipPath (Join-Path $filesDir "STORM_PS4_PKG_SENDER_${appVersion}.zip") -Force
 
 # Step 4: Build Custom StormInstaller
-Write-Host "[4/6] Building and Signing StormInstaller (Cyber Dark UI)..." -ForegroundColor Yellow
+Write-Host "[4/5] Building and Signing StormInstaller (Cyber Dark UI)..." -ForegroundColor Yellow
 dotnet publish "$installerProjDir\StormInstaller.csproj" -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=true
 
 $publishedInstaller = "$installerProjDir\bin\Release\net8.0-windows\win-x64\publish\StormInstaller.exe"
@@ -134,17 +131,8 @@ try {
     $pubStore.Close()
 } catch { }
 
-# Step 5: Packaging Smart App Control Setup Bundle
-Write-Host "[5/6] Packaging Setup Bundle..." -ForegroundColor Yellow
-if (Test-Path $bundleZipPath) { Remove-Item $bundleZipPath -Force -ErrorAction SilentlyContinue }
-if (Test-Path $sevenZip) {
-    $bundleItems = @($outputSetupExePath, $cerOutput)
-    & $sevenZip a -tzip -mx=7 -mmt=on $bundleZipPath @bundleItems
-    Copy-Item $bundleZipPath $filesDir -Force
-}
-
-# Step 6: Unblock output files
-Write-Host "[6/6] Unblocking files..." -ForegroundColor Yellow
+# Step 5: Unblock output files
+Write-Host "[5/5] Unblocking files..." -ForegroundColor Yellow
 Get-ChildItem -Path $outputDir, $filesDir -Recurse -Include *.exe, *.dll, *.bat, *.cmd, *.ps1, *.cer, *.zip -ErrorAction SilentlyContinue | ForEach-Object {
     Unblock-File -Path $_.FullName -ErrorAction SilentlyContinue
 }
@@ -153,7 +141,7 @@ Write-Host "============================================================" -Foreg
 Write-Host "BUILD AND PACKAGING COMPLETED ACCORDING TO STORM STANDARDS!" -ForegroundColor Green
 Write-Host "1. Installer (Files):     $setupExePath" -ForegroundColor Green
 Write-Host "2. Installer (Output):    $outputSetupExePath" -ForegroundColor Green
-Write-Host "3. Setup Bundle:          $bundleZipPath" -ForegroundColor Green
-Write-Host "4. Portable Archive:      $portableZipPath" -ForegroundColor Green
-Write-Host "5. Certificate:           $cerOutput" -ForegroundColor Green
+Write-Host "3. Portable Archive:      $portableZipPath" -ForegroundColor Green
+Write-Host "4. Certificate:           $cerOutput" -ForegroundColor Green
 Write-Host "============================================================" -ForegroundColor Green
+
