@@ -24,6 +24,7 @@ gar_data/
 # Keep tools in STORM PS4 PKG SENDER
 !tools/**/*.exe
 !tools/**/*.dll
+!tools/**/*.bin
 
 # Keep branding icons and graphics
 !Files/*.ico

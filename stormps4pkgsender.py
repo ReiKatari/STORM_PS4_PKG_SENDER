@@ -20,6 +20,8 @@ import shutil
 import shlex
 import tempfile
 import winreg
+import xml.sax.saxutils
+from ctypes import wintypes
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from http.server import SimpleHTTPRequestHandler, HTTPServer, BaseHTTPRequestHandler
@@ -35,22 +37,109 @@ from PyQt6.QtWidgets import (
     QSizePolicy, QSystemTrayIcon, QStackedWidget, QSplitter, QStyle, QInputDialog,
     QTableWidget, QTableWidgetItem, QProgressDialog
 )
-from PyQt6.QtCore import Qt, QSettings, pyqtSignal, QObject, QTimer, QSize, QThread, QMutex, QRect, QUrl, QEvent
+from PyQt6.QtCore import Qt, QSettings, pyqtSignal, QObject, QTimer, QSize, QThread, QMutex, QRect, QUrl, QEvent, QLocale
 from PyQt6.QtGui import (
     QColor, QBrush, QAction, QGuiApplication, QCursor, QPen, 
     QPalette, QGradient, QLinearGradient, QIcon, QPixmap, 
     QDesktopServices, QDrag, QShortcut, QKeySequence, QFont
 )
+from storm_payload import PayloadSession, check_goldhen_binloader
+from storm_console import PackegeFlowServiceClient
+from storm_torrent import QBittorrentClient, TorznabClient, TorrentAutoInstallWatcher
 
 
-CURRENT_VERSION = "1.2.84"
+CURRENT_VERSION = "1.4.0"
 GITHUB_REPO = "ReiKatari/STORM_PS4_PKG_SENDER"
 
+SUPPORTED_FIRMWARES = [
+    "5.05", "5.07", "6.50", "6.71", "6.72", "7.00", "7.02", "7.35", 
+    "7.50", "7.51", "7.55", "8.00", "8.03", "8.50", "8.52", "9.00", 
+    "9.03", "9.04", "9.50", "9.51", "9.60", "10.00", "10.01", "10.50", 
+    "10.70", "10.71", "11.00", "11.02", "11.50", "11.52", "12.00", 
+    "12.02", "12.50", "12.52", "13.00", "13.02", "13.04", "13.50", 
+    "13.52", "14.00"
+]
+
+def fw_version_to_int(fw_ver):
+    """Convert firmware version string ('5.05', '9.00', '11.00', '14.00') to Orbis SDK UINT32."""
+    try:
+        parts = fw_ver.strip().split('.')
+        maj = int(parts[0])
+        min_str = parts[1] if len(parts) > 1 else "00"
+        if len(min_str) == 1:
+            min_str += "0"
+        try:
+            min_ = int(min_str, 16)
+        except Exception:
+            min_ = int(min_str)
+        return (maj << 24) | (min_ << 16)
+    except Exception:
+        return 0x05050000
+
 try:
-    myappid = 'STORM.PS4Sender.Final.v1273'
+    myappid = 'STORM.PS4Sender.Final.v140'
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
-except ImportError:
+except Exception:
     pass
+
+# --- RANGE REQUEST WATCHDOG ---
+LAST_RANGE_REQUEST_TIME = {}
+
+# --- SINGLE INSTANCE GUARD ---
+SINGLE_INSTANCE_MUTEX_NAME = "Global\\STORM_PS4_PKG_SENDER_SingleInstanceMutex"
+_single_instance_mutex = None
+
+def acquire_single_instance():
+    """Ensure that only one instance of STORM PS4 PKG SENDER runs at a time."""
+    global _single_instance_mutex
+    try:
+        kernel32 = ctypes.windll.kernel32
+        _single_instance_mutex = kernel32.CreateMutexW(None, False, SINGLE_INSTANCE_MUTEX_NAME)
+        last_error = kernel32.GetLastError()
+        if last_error == 183: # ERROR_ALREADY_EXISTS
+            user32 = ctypes.windll.user32
+            found_hwnd = [0]
+            def enum_proc(hwnd, lparam):
+                length = user32.GetWindowTextLengthW(hwnd)
+                if length > 0:
+                    buff = ctypes.create_unicode_buffer(length + 1)
+                    user32.GetWindowTextW(hwnd, buff, length + 1)
+                    if "STORM PS4 PKG SENDER" in buff.value:
+                        found_hwnd[0] = hwnd
+                        return False
+                return True
+            WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+            user32.EnumWindows(WNDENUMPROC(enum_proc), 0)
+            if found_hwnd[0]:
+                user32.ShowWindow(found_hwnd[0], 9) # SW_RESTORE
+                user32.SetForegroundWindow(found_hwnd[0])
+            ctypes.windll.user32.MessageBoxW(
+                0,
+                "Экземпляр STORM PS4 PKG SENDER уже запущен.\nAn instance of STORM PS4 PKG SENDER is already running.",
+                "STORM PS4 PKG SENDER",
+                0x40 # MB_ICONINFORMATION
+            )
+            return False
+        return True
+    except Exception as e:
+        log(f"Single instance check exception: {e}", "WARN")
+        return True
+
+# --- APPDATA CONFIG DIRECTORY ---
+def get_app_data_dir():
+    appdata = os.environ.get("APPDATA") or os.path.expanduser("~")
+    base_dir = os.path.join(appdata, "STORM PS4 PKG SENDER")
+    os.makedirs(base_dir, exist_ok=True)
+    return base_dir
+
+def get_pinned_file_path():
+    app_data_path = os.path.join(get_app_data_dir(), "pinned.json")
+    if not os.path.exists(app_data_path) and os.path.exists("pinned.json"):
+        try:
+            shutil.copy2("pinned.json", app_data_path)
+        except Exception:
+            pass
+    return app_data_path
 
 # --- GLOBAL LOG BUFFER ---
 LOG_BUFFER = deque(maxlen=500)  # Keep last 500 log entries
@@ -90,7 +179,11 @@ def perform_cleanup(settings_val):
                 dlog("Drive Root was empty, defaulting to C:")
                 
             if not drive_root.endswith(os.sep): drive_root += os.sep
-            temp_bp_root = os.path.join(drive_root, "STORM_BP_TEMP")
+            temp_bp_root = os.path.join(tempfile.gettempdir(), "STORM_BP_TEMP")
+            legacy_root = os.path.join(drive_root, "STORM_BP_TEMP")
+            if os.path.exists(legacy_root):
+                try: shutil.rmtree(legacy_root, ignore_errors=True)
+                except Exception: pass
             dlog(f"Target Cleanup Path: {temp_bp_root}")
             
             try:
@@ -176,12 +269,6 @@ def perform_cleanup(settings_val):
         except: pass
     
     dlog("=== EXIT CLEANUP END ===")
-    entry = f"[{timestamp}] [{level}] {msg}"
-    with LOG_LOCK:
-        LOG_BUFFER.append(entry)
-    # Filter out noisy logs from console
-    if level in ["INFO", "WARN", "ERROR"]:
-        print(entry)
 
 def resource_path(relative_path):
     try:
@@ -199,52 +286,7 @@ def hide_console():
 
 
 
-def get_pkg_info_from_sfo(data):
-    """Parse raw SFO data and return a dictionary of keys/values."""
-    info = {}
-    try:
-        magic = data[:4]
-        if magic != b"\x00PSF": return info
-        
-        key_table_start = struct.unpack_from("<I", data, 0x08)[0]
-        data_table_start = struct.unpack_from("<I", data, 0x0C)[0]
-        entries_count = struct.unpack_from("<I", data, 0x10)[0]
-        
-        for i in range(entries_count):
-            offset = 0x14 + (i * 16)
-            key_offset = struct.unpack_from("<H", data, offset)[0]
-            data_fmt = struct.unpack_from("<H", data, offset + 2)[0]
-            data_len = struct.unpack_from("<I", data, offset + 4)[0]
-            data_max_len = struct.unpack_from("<I", data, offset + 8)[0]
-            data_offset = struct.unpack_from("<I", data, offset + 12)[0]
-            
-            key_addr = key_table_start + key_offset
-            key_end = data.find(b"\x00", key_addr)
-            if key_end == -1: key_end = len(data)
-            key = data[key_addr:key_end].decode("utf-8", errors="ignore")
-            
-            val_addr = data_table_start + data_offset
-            val_data = data[val_addr:val_addr+data_len]
-            
-            # Formats: 0x0404=int, 0x0204=utf8, 0x0004=utf8_special
-            val = ""
-            if data_fmt in [0x0204, 0x0004]:
-                val = val_data.decode("utf-8", errors="ignore").rstrip("\x00")
-            elif data_fmt == 0x0404:
-                val = str(struct.unpack("<I", val_data)[0])
-            else:
-                val = str(val_data)
-            
-            info[key.upper()] = val
-            # log(f"SFO Key: {key} -> {val}", "DEBUG")
-    except Exception as e:
-        log(f"SFO Parse Error: {e}", "WARN")
-    return info
 # --- UTILS ---
-class CenterDelegate(QStyledItemDelegate):
-    def initStyleOption(self, option, index):
-        super().initStyleOption(option, index)
-        option.displayAlignment = Qt.AlignmentFlag.AlignCenter
 
 class ImagePreviewDialog(QDialog):
     def __init__(self, parent, image_data, title="Preview"):
@@ -285,7 +327,7 @@ LOCALE = {
         "hide_pinned": "Скрыть закрепленное",
         "large_font": "Крупный шрифт",
         "backup_btn": "💾 Бэкап",
-        "restore_btn": "♻ Восстановление бэкапа", 
+        "restore_btn": "♻ Восстановление бэкапа",
         "btn_add_main": "➕ Добавить",
         "menu_add_files": "📄 Файлы (.pkg / .bin)",
         "menu_add_folder": "📁 Папку",
@@ -311,9 +353,9 @@ LOCALE = {
         "server_ok": "Сервер: {} (OK)",
         "server_err": "Ошибка сервера",
         "status_offline": "Не в сети",
-        "status_rpi_full": "В сети (RPI, FTP, BinLoader)",
-        "status_sppi_full": "В сети (SPPI, FTP, BinLoader)",
-        "status_ftp_bin": "В сети (FTP и BinLoader)",
+        "status_rpi_full": "В сети (RPI)",
+        "status_sppi_full": "В сети (SPPI)",
+        "status_ftp_bin": "В сети (FTP, BinLoader)",
         "status_ftp_only": "В сети (Только FTP)",
         "status_bin_only": "В сети (Только BinLoader)",
         "checking": "Проверка...",
@@ -364,7 +406,7 @@ LOCALE = {
         "ftp_warning_text": "Все изменения в FTP Browser вы производите на свой страх и риск!\nРазработчик не несет ответственности за удаленные системные файлы.",
         "ftp_warning_chk": "Больше не показывать",
         "rename_wide": "Новое имя файла:",
-        "cancel": "Отменить",
+        "cancel": "Отмена",
         "rest_title": "Восстановление сохранений на PS4",
         "rest_browse": "📂 Выбрать бэкап",
         "rest_send": "Передать в PS4",
@@ -382,13 +424,7 @@ LOCALE = {
         "auto_update": "Авто-обновление",
         "upd_title": "Доступно обновление",
         "upd_msg": "Доступна новая версия: <b>{}</b><br>Хотите скачать и установить обновление?",
-        "status_sppi_full": "В сети (SPPI)",
-        "status_rpi_full": "В сети (RPI)",
-        "status_ftp_bin": "В сети (FTP, BinLoader)",
-        "status_ftp_only": "В сети (Только FTP)",
-        "status_bin_only": "В сети (Только BinLoader)",
         "status_online": "В сети",
-        "status_offline": "Не в сети",
         "upd_btn": "🚀 Обновить",
         "upd_skip": "Позже",
         "upd_no_new": "✅ Установлена последняя версия",
@@ -441,13 +477,10 @@ LOCALE = {
         "ctx_change_title": "✏ Изменить отображаемое имя",
         "change_title": "Изменение имени",
         "new_title": "Новое имя:",
-        "ok": "Готово",
-        "cancel": "Отмена",
+        "ok": "OK",
         "confirm_exit_text": "Закрыть программу или свернуть в трей?",
         "btn_exit": "Закрыть",
         "btn_tray": "Свернуть в трей",
-        "ok": "OK",
-        "cancel": "Отмена",
         "bp_pass_title": "Ввод Passcode PKG",
         "bp_pass_info": "Этот Retail PKG зашифрован уникальным паролем.\nПожалуйста, введите 32-значный passcode:",
         "bp_pass_extract": "📂 Извлечь из Base PKG (Игры)",
@@ -468,7 +501,53 @@ LOCALE = {
         "scan_folder": "Сканирование папки...",
         "add_files": "Добавление {} файлов...",
         "scan_dropped_folders": "Сканирование перетянутых папок...",
-        "add_dropped_files": "Добавление {} перетянутых файлов..."
+        "add_dropped_files": "Добавление {} перетянутых файлов...",
+        "tab_torrents": "Торренты и загрузки",
+        "tab_console": "Консоль и сервисы",
+        "tab_sender": "Отправка PKG",
+        "tab_ftp": "Файловый менеджер",
+        "tab_manager": "Менеджер PKG",
+        "tab_settings": "Настройки",
+        "qbit_settings": "Настройки qBittorrent",
+        "qbit_url": "URL Web UI:",
+        "qbit_user": "Пользователь:",
+        "qbit_pass": "Пароль:",
+        "qbit_local_dir": "Папка загрузок ПК:",
+        "qbit_nas_dir": "Папка в qBittorrent (NAS):",
+        "qbit_connect": "🔗 Подключить",
+        "qbit_add_torrent": "Magnet-ссылка или URL торрента:",
+        "qbit_auto_install": "Автоустановка PKG на PS4 после завершения",
+        "qbit_btn_download": "📥 Скачать",
+        "qbit_col_name": "Название",
+        "qbit_col_size": "Размер",
+        "qbit_col_prog": "Прогресс",
+        "qbit_col_speed": "Скорость",
+        "qbit_col_status": "Статус",
+        "qbit_col_actions": "Действия",
+        "torznab_search": "Поиск торрентов через Jackett / Prowlarr",
+        "torznab_url": "Torznab URL:",
+        "torznab_key": "API Ключ:",
+        "torznab_query": "Поиск игры или патча...",
+        "torznab_find": "🔍 Найти",
+        "console_refresh": "🔄 Обновить консоль",
+        "console_system_info": "Сведения о системе и накопителях",
+        "console_firmware": "Прошивка:",
+        "console_model": "Модель PS4:",
+        "console_hen": "Статус GoldHEN:",
+        "console_storage": "Накопители консоли",
+        "console_installed_apps": "Установленные на PS4 игры и дополнения",
+        "console_uninstall_comp": "🗑 Удалить выбранный компонент",
+        "transport_mode": "Транспорт отправки:",
+        "transport_rpi": "Remote Package Installer (Порт 12800)",
+        "transport_payload": "DirectPackageInstaller Payload (Порт 9090, с иконкой на экране)",
+        "transport_service": "PackegeFlowService (Порт 12801)",
+        "unconfirmed_download": "⚠ Не подтверждено (PS4 не скачивает)",
+        "unconfirmed_download_tooltip": "PS4 приняла команду, но не запросила данные по сети в течение 20 секунд. Проверьте свободное место на диске PS4 или наличие ошибки в меню Загрузки на консоли.",
+        "ftp_quick_jump": "Быстрый переход PS4:",
+        "ftp_send_to_queue": "➕ Добавить PKG в очередь установки",
+        "ftp_nav_back": "⬅ Назад",
+        "ftp_nav_forward": "➡ Вперед",
+        "ftp_nav_up": "⬆ Вверх"
     },
     "en": {
         "window_title": f"STORM PS4 PKG SENDER v{CURRENT_VERSION}",
@@ -630,8 +709,6 @@ LOCALE = {
         "confirm_exit_text": "Exit program or minimize to tray?",
         "btn_exit": "Exit",
         "btn_tray": "Minimize to Tray",
-        "ok": "OK",
-        "cancel": "Cancel",
         "bp_pass_title": "Enter PKG Passcode",
         "bp_pass_info": "This Retail PKG is encrypted with a unique passcode.\nPlease enter the 32-character passcode:",
         "bp_pass_extract": "📂 Extract from Base PKG (Game)",
@@ -643,17 +720,1001 @@ LOCALE = {
         "bp_pass_not_found": "❌ Passcode not found in PKG info.\nMake sure it is an FPKG or Base Game.",
         "ftp_search_placeholder": "Search local...",
         "ftp_search_placeholder_remote": "Search remote...",
-        "recursive": "Recursive",
         "concurrent_installs": "Concurrent Installs:",
         "scan_folder": "Scanning folder...",
         "add_files": "Adding {} files...",
         "scan_dropped_folders": "Scanning dropped folders...",
         "add_dropped_files": "Adding {} dropped files...",
-        "ftp_searching": "🔎 Searching...",
-        "concurrent_installs": "Concurrent Installs:"
+        "backport_tool": "Backport Tool",
+        "backport_ctx": "🔧 Create Backport (PKG)",
+        "backport_error": "Backport Error",
+        "backport_config_err": "Please check that orbis-pub-cmd.exe exists in the tools folder.",
+        "icon_not_found": "Icon not found",
+        "icon_header_err": "Icon not found in header",
+        "ftp_warning_title": "Warning!",
+        "ftp_warning_text": "All changes in the FTP Browser are at your own risk!\nThe developer is not responsible for deleted system files.",
+        "ftp_warning_chk": "Do not show again",
+        "rename_wide": "New file name:",
+        "tab_torrents": "Torrents and Downloads",
+        "tab_console": "Console and Services",
+        "tab_sender": "PKG Sender",
+        "tab_ftp": "FTP Browser",
+        "tab_manager": "PKG Manager",
+        "tab_settings": "Settings",
+        "qbit_settings": "qBittorrent Settings",
+        "qbit_url": "Web UI URL:",
+        "qbit_user": "Username:",
+        "qbit_pass": "Password:",
+        "qbit_local_dir": "Local Downloads Folder:",
+        "qbit_nas_dir": "Remote Folder in qBittorrent (NAS):",
+        "qbit_connect": "🔗 Connect",
+        "qbit_add_torrent": "Magnet link or torrent URL:",
+        "qbit_auto_install": "Auto-install PKG to PS4 upon completion",
+        "qbit_btn_download": "📥 Download",
+        "qbit_col_name": "Name",
+        "qbit_col_size": "Size",
+        "qbit_col_prog": "Progress",
+        "qbit_col_speed": "Speed",
+        "qbit_col_status": "Status",
+        "qbit_col_actions": "Actions",
+        "torznab_search": "Search torrents via Jackett / Prowlarr",
+        "torznab_url": "Torznab URL:",
+        "torznab_key": "API Key:",
+        "torznab_query": "Search game or patch...",
+        "torznab_find": "🔍 Search",
+        "console_refresh": "🔄 Refresh Console",
+        "console_system_info": "System and Storage Information",
+        "console_firmware": "Firmware:",
+        "console_model": "PS4 Model:",
+        "console_hen": "GoldHEN Status:",
+        "console_storage": "Console Storage",
+        "console_installed_apps": "Installed Games and Add-ons on PS4",
+        "console_uninstall_comp": "🗑 Remove Selected Component",
+        "transport_mode": "Install Transport:",
+        "transport_rpi": "Remote Package Installer (Port 12800)",
+        "transport_payload": "DirectPackageInstaller Payload (Port 9090, on-screen icon and title)",
+        "transport_service": "PackegeFlowService (Port 12801)",
+        "unconfirmed_download": "⚠ Unconfirmed (PS4 not downloading)",
+        "unconfirmed_download_tooltip": "The PS4 accepted the task, but did not request data over the network within 20 seconds. Check free storage on the PS4 or view Notifications / Downloads for errors.",
+        "ftp_quick_jump": "PS4 Quick Jump:",
+        "ftp_send_to_queue": "➕ Add PKG to Install Queue",
+        "ftp_nav_back": "⬅ Back",
+        "ftp_nav_forward": "➡ Forward",
+        "ftp_nav_up": "⬆ Up"
+    },
+    "de": {
+        "window_title": f"STORM PS4 PKG SENDER v{CURRENT_VERSION}",
+        "confirm_uninstall": "Deinstallation bestätigen",
+        "msg_confirm_uninstall": "{} ({}) deinstallieren?",
+        "ps4_ip": "PS4 IP:",
+        "check_conn": "🔗 Prüfen",
+        "scan_net": "🌐 Suchen",
+        "overwrite": "Überschreiben",
+        "hide_pinned": "Angeheftete ausblenden",
+        "large_font": "Große Schrift",
+        "backup_btn": "💾 Backup",
+        "restore_btn": "♻ Backup wiederherstellen",
+        "btn_add_main": "➕ Hinzufügen",
+        "menu_add_files": "📄 Dateien (.pkg / .bin)",
+        "menu_add_folder": "📁 Ordner",
+        "col_file": "Datei / Pfad",
+        "col_tid": "ID / Typ",
+        "col_ver": "Version",
+        "col_size": "Größe",
+        "col_region": "Region",
+        "col_category": "Kategorie",
+        "col_speed": "Geschwindigkeit",
+        "col_prog": "Fortschritt",
+        "col_status": "Status",
+        "col_act": "Aktionen",
+        "collapse": "🔼 Alle einklappen",
+        "expand": "🔽 Alle ausklappen",
+        "pause_global": "⏸ Alle pausieren",
+        "resume_global": "▶ Alle fortsetzen",
+        "cancel_all": "✖ Alle abbrechen",
+        "install_all": "🚀 Alle senden",
+        "waiting": "Warten...",
+        "ready": "Bereit",
+        "server_off": "Server: Aus",
+        "server_ok": "Server: {} (OK)",
+        "server_err": "Serverfehler",
+        "status_offline": "Offline",
+        "status_rpi_full": "Online (RPI, FTP, BinLoader)",
+        "status_sppi_full": "Online (SPPI, FTP, BinLoader)",
+        "status_ftp_bin": "Online (FTP und BinLoader)",
+        "status_ftp_only": "Online (Nur FTP)",
+        "status_bin_only": "Online (Nur BinLoader)",
+        "checking": "Prüfen...",
+        "installing": "Installieren...",
+        "sending_bin": "Payload senden...",
+        "paused": "Pausiert",
+        "error": "Fehler",
+        "cancelled": "Abgebrochen",
+        "installed": "Installiert",
+        "sent_payload": "Payload gesendet",
+        "already": "Bereits installiert",
+        "sent": "Link akzeptiert",
+        "not_installed": "Nicht installiert",
+        "queue_paused": "⏸ Warteschlange pausiert",
+        "queue_resumed": "▶ Warteschlange fortgesetzt",
+        "scan_start": "🔍 Suche PS4 im Netzwerk...",
+        "scan_found": "✅ PS4 gefunden: {}",
+        "scan_fail": "❌ PS4 nicht im Netzwerk gefunden",
+        "install_sel": "Ausgewählte senden ({})",
+        "pin": "📌 Anheften",
+        "unpin": "❌ Lösen",
+        "pin_sel": "📌 Ausgewählte anheften ({})",
+        "unpin_sel": "❌ Ausgewählte lösen ({})",
+        "remove_list": "Aus Liste entfernen",
+        "copy": "📋 {} kopiert!",
+        "done": "Fertig",
+        "sending": "Senden {}%",
+        "skipped_no_space": "Übersprungen, kein Speicherplatz",
+        "busy": "PS4 beschäftigt (Busy)",
+        "timeout": "Verbindungs-Timeout",
+        "frozen": "RPI reagiert nicht? PS4-App neu starten",
+        "bkp_title": "Backup-Einstellungen",
+        "bkp_grp": "Automatisches Backup (FTP)",
+        "bkp_enable": "Auto-Backup aktivieren",
+        "bkp_path": "Speicherordner:",
+        "bkp_int": "Prüfintervall:",
+        "bkp_run": "▶ Backup jetzt starten",
+        "bkp_info": "<i>* Erfordert aktives GoldHEN (Port 2121).<br>* Spielstände werden nach Datum/Uhrzeit geordnet.</i>",
+        "save": "Speichern",
+        "backport_tool": "Backport-Tool",
+        "backport_ctx": "🔧 Backport erstellen (PKG)",
+        "backport_error": "Backport-Fehler",
+        "backport_config_err": "Bitte prüfen Sie, ob orbis-pub-cmd.exe im tools-Ordner vorhanden ist.",
+        "icon_not_found": "Symbol nicht gefunden",
+        "icon_header_err": "Symbol nicht im Header gefunden",
+        "icon_preview": "Symbolvorschau",
+        "ftp_warning_title": "Achtung!",
+        "ftp_warning_text": "Alle Änderungen im FTP-Browser erfolgen auf eigene Gefahr!\nDer Entwickler haftet nicht für gelöschte Systemdateien.",
+        "ftp_warning_chk": "Nicht mehr anzeigen",
+        "rename_wide": "Neuer Dateiname:",
+        "cancel": "Abbrechen",
+        "rest_title": "Spielstände auf PS4 wiederherstellen",
+        "rest_browse": "📂 Backup wählen",
+        "rest_send": "An PS4 senden",
+        "rest_col1": "Benutzer / Title ID",
+        "rest_col2": "Dateipfad",
+        "rest_success": "✅ Wiederherstellung erfolgreich!",
+        "rest_start": "🚀 Wiederherstellung gestartet...",
+        "report_wait": "⏳ Fertig. Nächste in {}s...",
+        "confirm_title": "Bestätigung",
+        "confirm_cancel_all": "Möchten Sie wirklich alle Aufgaben abbrechen?\nDie Warteschlange wird geleert.",
+        "btn_yes": "Bestätigen",
+        "btn_no": "Abbrechen",
+        "yes": "Ja",
+        "no": "Nein",
+        "auto_update": "Auto-Update",
+        "upd_title": "Update verfügbar",
+        "upd_msg": "Neue Version verfügbar: <b>{}</b><br>Möchten Sie das Update herunterladen und installieren?",
+        "status_online": "Online",
+        "upd_btn": "🚀 Aktualisieren",
+        "upd_skip": "Später",
+        "upd_no_new": "✅ Neueste Version installiert",
+        "upd_err": "❌ Fehler bei der Update-Prüfung",
+        "upd_downloading": "📥 Update wird geladen... {}%",
+        "stat_total": "Gesamt: {} | Fertig: {} | Fehler: {}",
+        "stat_size": "Größe: {} / {}",
+        "stat_eta": "Verbleibende Zeit: {}",
+        "tray_show": "Anzeigen / Ausblenden",
+        "tray_exit": "Beenden",
+        "ctx_folder": "📂 Im Ordner anzeigen",
+        "ctx_extract_icon": "🖼 Symbol extrahieren",
+        "ctx_rename_pkg": "✏ PKG umbenennen",
+        "col_visibility": "Spalten ein-/ausblenden",
+        "mini_mode": "Kompakter Modus",
+        "logs_title": "📋 Protokolle",
+        "logs_copy": "📋 Kopieren",
+        "logs_clear": "🗑 Löschen",
+        "logs_close": "✖ Schließen",
+        "logs_empty": "(Noch keine Protokolle)",
+        "logs_cleared": "(Protokolle gelöscht)",
+        "ftp_pc": "PC:",
+        "ftp_ps4": "PS4:",
+        "ftp_connect": "🔗 Verbinden",
+        "ftp_disconnect": "❌ Trennen",
+        "ftp_upload": "➡ Hochladen",
+        "ftp_download": "⬅ Herunterladen",
+        "ftp_mkdir": "📁 Neuer Ordner",
+        "ftp_delete": "❌ Löschen",
+        "ftp_name": "Name",
+        "ftp_size": "Größe",
+        "ftp_date": "Datum",
+        "ftp_refresh": "Aktualisieren",
+        "pkg_connect": "🔗 Verbinden",
+        "pkg_refresh": "🔄 Aktualisieren",
+        "pkg_launch": "🚀 Starten",
+        "pkg_uninstall": "🗑 Deinstallieren",
+        "pkg_title": "Titel",
+        "pkg_tid": "Title ID",
+        "pkg_ver": "Version",
+        "pkg_size": "Größe",
+        "bp_title": "Backport-Tool",
+        "bp_my_list": "Eigene Liste",
+        "bp_all_fw": "Alle Firmwares",
+        "bp_target": "Ziel: {}",
+        "bp_fw": "Firmware wählen:",
+        "bp_save": "Zielordner:",
+        "bp_start": "Starten",
+        "bp_browse": "Durchsuchen",
+        "ctx_change_title": "✏ Anzeigenamen ändern",
+        "change_title": "Namen ändern",
+        "new_title": "Neuer Name:",
+        "ok": "OK",
+        "confirm_exit_text": "Programm beenden oder in den Infobereich minimieren?",
+        "btn_exit": "Beenden",
+        "btn_tray": "In den Infobereich",
+        "bp_pass_title": "Passcode für PKG eingeben",
+        "bp_pass_info": "PKG-Datei ist verschlüsselt.\nGeben Sie den 32-stelligen Passcode ein:",
+        "bp_pass_extract": "Entpacken",
+        "bp_pass_extract_tip": "Passcode aus Base PKG extrahieren",
+        "bp_my_list_settings": "Firmware-Auswahl für Eigene Liste",
+        "bp_pass_select_base": "Basis-PKG auswählen",
+        "bp_pass_found": "Passcode gefunden: {}",
+        "bp_pass_not_found_title": "Passcode nicht gefunden",
+        "bp_pass_not_found": "Passcode konnte nicht ermittelt werden.",
+        "ftp_search_placeholder": "Lokal suchen...",
+        "ftp_search_placeholder_remote": "Auf PS4 suchen...",
+        "recursive": "Rekursiv",
+        "ftp_searching": "🔎 Suchen...",
+        "ctx_view_img": "🖼 Bild ansehen",
+        "ctx_rename": "✏ Umbenennen",
+        "ctx_new_folder": "📁 Neuer Ordner",
+        "concurrent_installs": "Gleichzeitige Installationen:",
+        "scan_folder": "Ordner wird gescannt...",
+        "add_files": "{} Dateien werden hinzugefügt...",
+        "scan_dropped_folders": "Abgelegte Ordner werden gescannt...",
+        "add_dropped_files": "{} abgelegte Dateien werden hinzugefügt...",
+        "tab_torrents": "Torrents und Downloads",
+        "tab_console": "Konsole und Dienste",
+        "tab_sender": "PKG-Sender",
+        "tab_ftp": "FTP-Browser",
+        "tab_manager": "PKG-Manager",
+        "tab_settings": "Einstellungen",
+        "qbit_settings": "qBittorrent-Einstellungen",
+        "qbit_url": "Web-UI-URL:",
+        "qbit_user": "Benutzername:",
+        "qbit_pass": "Passwort:",
+        "qbit_local_dir": "Lokaler Download-Ordner:",
+        "qbit_nas_dir": "Remote-Ordner in qBittorrent (NAS):",
+        "qbit_connect": "🔗 Verbinden",
+        "qbit_add_torrent": "Magnet-Link oder Torrent-URL:",
+        "qbit_auto_install": "PKG nach Fertigstellung automatisch auf PS4 installieren",
+        "qbit_btn_download": "📥 Herunterladen",
+        "qbit_col_name": "Name",
+        "qbit_col_size": "Größe",
+        "qbit_col_prog": "Fortschritt",
+        "qbit_col_speed": "Geschwindigkeit",
+        "qbit_col_status": "Status",
+        "qbit_col_actions": "Aktionen",
+        "torznab_search": "Torrent-Suche über Jackett / Prowlarr",
+        "torznab_url": "Torznab-URL:",
+        "torznab_key": "API-Schlüssel:",
+        "torznab_query": "Spiel oder Patch suchen...",
+        "torznab_find": "🔍 Suchen",
+        "console_refresh": "🔄 Konsole aktualisieren",
+        "console_system_info": "System- und Speicherinformationen",
+        "console_firmware": "Firmware:",
+        "console_model": "PS4-Modell:",
+        "console_hen": "GoldHEN-Status:",
+        "console_storage": "Konsolenspeicher",
+        "console_installed_apps": "Auf der PS4 installierte Spiele und Add-ons",
+        "console_uninstall_comp": "🗑 Ausgewählte Komponente entfernen",
+        "transport_mode": "Installations-Transport:",
+        "transport_rpi": "Remote Package Installer (Port 12800)",
+        "transport_payload": "DirectPackageInstaller Payload (Port 9090, mit Symbol und Titel)",
+        "transport_service": "PackegeFlowService (Port 12801)",
+        "unconfirmed_download": "⚠ Unbestätigt (PS4 lädt nicht herunter)",
+        "unconfirmed_download_tooltip": "Die PS4 hat den Befehl angenommen, aber innerhalb von 20 Sekunden keine Daten angefordert. Überprüfen Sie den freien Speicherplatz oder Downloads auf der PS4.",
+        "ftp_quick_jump": "PS4-Schnellsprung:",
+        "ftp_send_to_queue": "➕ PKG zur Installationswarteschlange hinzufügen",
+        "ftp_nav_back": "⬅ Zurück",
+        "ftp_nav_forward": "➡ Vorwärts",
+        "ftp_nav_up": "⬆ Nach oben"
+    },
+    "fr": {
+        "window_title": f"STORM PS4 PKG SENDER v{CURRENT_VERSION}",
+        "confirm_uninstall": "Confirmer la désinstallation",
+        "msg_confirm_uninstall": "Désinstaller {} ({}) ?",
+        "ps4_ip": "IP PS4 :",
+        "check_conn": "🔗 Vérifier",
+        "scan_net": "🌐 Rechercher",
+        "overwrite": "Écraser",
+        "hide_pinned": "Masquer les épinglés",
+        "large_font": "Grande police",
+        "backup_btn": "💾 Sauvegarde",
+        "restore_btn": "♻ Restaurer la sauvegarde",
+        "btn_add_main": "➕ Ajouter",
+        "menu_add_files": "📄 Fichiers (.pkg / .bin)",
+        "menu_add_folder": "📁 Dossier",
+        "col_file": "Fichier / Chemin",
+        "col_tid": "ID / Type",
+        "col_ver": "Version",
+        "col_size": "Taille",
+        "col_region": "Région",
+        "col_category": "Catégorie",
+        "col_speed": "Vitesse",
+        "col_prog": "Progression",
+        "col_status": "Statut",
+        "col_act": "Actions",
+        "collapse": "🔼 Tout replier",
+        "expand": "🔽 Tout déplier",
+        "pause_global": "⏸ Tout mettre en pause",
+        "resume_global": "▶ Tout reprendre",
+        "cancel_all": "✖ Tout annuler",
+        "install_all": "🚀 Tout envoyer",
+        "waiting": "En attente...",
+        "ready": "Prêt",
+        "server_off": "Serveur : Arrêté",
+        "server_ok": "Serveur : {} (OK)",
+        "server_err": "Erreur serveur",
+        "status_offline": "Hors ligne",
+        "status_rpi_full": "En ligne (RPI, FTP, BinLoader)",
+        "status_sppi_full": "En ligne (SPPI, FTP, BinLoader)",
+        "status_ftp_bin": "En ligne (FTP et BinLoader)",
+        "status_ftp_only": "En ligne (FTP uniquement)",
+        "status_bin_only": "En ligne (BinLoader uniquement)",
+        "checking": "Vérification...",
+        "installing": "Installation...",
+        "sending_bin": "Envoi du payload...",
+        "paused": "En pause",
+        "error": "Erreur",
+        "cancelled": "Annulé",
+        "installed": "Installé",
+        "sent_payload": "Payload envoyé",
+        "already": "Déjà installé",
+        "sent": "Lien accepté",
+        "not_installed": "Non installé",
+        "queue_paused": "⏸ File d'attente en pause",
+        "queue_resumed": "▶ File d'attente reprise",
+        "scan_start": "🔍 Recherche de la PS4 sur le réseau...",
+        "scan_found": "✅ PS4 trouvée : {}",
+        "scan_fail": "❌ PS4 introuvable sur le réseau",
+        "install_sel": "Envoyer la sélection ({})",
+        "pin": "📌 Épingler",
+        "unpin": "❌ Détacher",
+        "pin_sel": "📌 Épingler la sélection ({})",
+        "unpin_sel": "❌ Détacher la sélection ({})",
+        "remove_list": "Retirer de la liste",
+        "copy": "📋 {} copié !",
+        "done": "Terminé",
+        "sending": "Envoi {}%",
+        "skipped_no_space": "Ignoré, espace insuffisant",
+        "busy": "PS4 occupée (Busy)",
+        "timeout": "Délai d'attente dépassé",
+        "frozen": "RPI bloqué ? Redémarrez l'application PS4",
+        "bkp_title": "Paramètres de sauvegarde",
+        "bkp_grp": "Sauvegarde automatique (FTP)",
+        "bkp_enable": "Activer l'auto-sauvegarde",
+        "bkp_path": "Dossier de sauvegarde :",
+        "bkp_int": "Intervalle de vérification :",
+        "bkp_run": "▶ Lancer la sauvegarde",
+        "bkp_info": "<i>* Nécessite GoldHEN actif (port 2121).<br>* Les sauvegardes sont classées par date/heure.</i>",
+        "save": "Enregistrer",
+        "backport_tool": "Outil de Backport",
+        "backport_ctx": "🔧 Créer un Backport (PKG)",
+        "backport_error": "Erreur de Backport",
+        "backport_config_err": "Veuillez vérifier la présence d'orbis-pub-cmd.exe dans le dossier tools.",
+        "icon_not_found": "Icône introuvable",
+        "icon_header_err": "Icône introuvable dans l'en-tête",
+        "icon_preview": "Aperçu de l'icône",
+        "ftp_warning_title": "Attention !",
+        "ftp_warning_text": "Toutes les modifications dans le navigateur FTP sont à vos risques et périls !\nLe développeur n'est pas responsable des fichiers système supprimés.",
+        "ftp_warning_chk": "Ne plus afficher",
+        "rename_wide": "Nouveau nom de fichier :",
+        "cancel": "Annuler",
+        "rest_title": "Restaurer les sauvegardes sur PS4",
+        "rest_browse": "📂 Choisir une sauvegarde",
+        "rest_send": "Envoyer vers PS4",
+        "rest_col1": "Utilisateur / Title ID",
+        "rest_col2": "Chemin des fichiers",
+        "rest_success": "✅ Restauration réussie !",
+        "rest_start": "🚀 Début de la restauration...",
+        "report_wait": "⏳ Terminé. Suivant dans {}s...",
+        "confirm_title": "Confirmation",
+        "confirm_cancel_all": "Voulez-vous vraiment annuler toutes les tâches ?\nLa file d'attente sera vidée.",
+        "btn_yes": "Confirmer",
+        "btn_no": "Annuler",
+        "yes": "Oui",
+        "no": "Non",
+        "auto_update": "Mise à jour auto",
+        "upd_title": "Mise à jour disponible",
+        "upd_msg": "Nouvelle version disponible : <b>{}</b><br>Voulez-vous la télécharger et l'installer ?",
+        "status_online": "En ligne",
+        "upd_btn": "🚀 Mettre à jour",
+        "upd_skip": "Plus tard",
+        "upd_no_new": "✅ Dernière version installée",
+        "upd_err": "❌ Erreur de vérification de mise à jour",
+        "upd_downloading": "📥 Téléchargement de la mise à jour... {}%",
+        "stat_total": "Total : {} | Terminé : {} | Erreurs : {}",
+        "stat_size": "Taille : {} / {}",
+        "stat_eta": "Temps restant : {}",
+        "tray_show": "Afficher / Masquer",
+        "tray_exit": "Quitter",
+        "ctx_folder": "📂 Ouvrir dans le dossier",
+        "ctx_extract_icon": "🖼 Extraire l'icône",
+        "ctx_rename_pkg": "✏ Renommer le PKG",
+        "col_visibility": "Afficher/masquer les colonnes",
+        "mini_mode": "Mode compact",
+        "logs_title": "📋 Journaux",
+        "logs_copy": "📋 Copier",
+        "logs_clear": "🗑 Effacer",
+        "logs_close": "✖ Fermer",
+        "logs_empty": "(Aucun journal pour le moment)",
+        "logs_cleared": "(Journaux effacés)",
+        "ftp_pc": "PC :",
+        "ftp_ps4": "PS4 :",
+        "ftp_connect": "🔗 Se connecter",
+        "ftp_disconnect": "❌ Se déconnecter",
+        "ftp_upload": "➡ Téléverser",
+        "ftp_download": "⬅ Télécharger",
+        "ftp_mkdir": "📁 Nouveau dossier",
+        "ftp_delete": "❌ Supprimer",
+        "ftp_name": "Nom",
+        "ftp_size": "Taille",
+        "ftp_date": "Date",
+        "ftp_refresh": "Actualiser",
+        "pkg_connect": "🔗 Se connecter",
+        "pkg_refresh": "🔄 Actualiser",
+        "pkg_launch": "🚀 Lancer",
+        "pkg_uninstall": "🗑 Désinstaller",
+        "pkg_title": "Titre",
+        "pkg_tid": "Title ID",
+        "pkg_ver": "Version",
+        "pkg_size": "Taille",
+        "bp_title": "Outil de Backport",
+        "bp_my_list": "Ma liste",
+        "bp_all_fw": "Tous les firmwares",
+        "bp_target": "Cible : {}",
+        "bp_fw": "Choisir le firmware :",
+        "bp_save": "Dossier de destination :",
+        "bp_start": "Démarrer",
+        "bp_browse": "Parcourir",
+        "ctx_change_title": "✏ Modifier le nom affiché",
+        "change_title": "Changement de nom",
+        "new_title": "Nouveau nom :",
+        "ok": "OK",
+        "confirm_exit_text": "Fermer l'application ou réduire dans la zone de notification ?",
+        "btn_exit": "Quitter",
+        "btn_tray": "Réduire dans la zone",
+        "bp_pass_title": "Saisie du mot de passe PKG",
+        "bp_pass_info": "Le fichier PKG est chiffré.\nEntrez le mot de passe à 32 caractères :",
+        "bp_pass_extract": "Extraire",
+        "bp_pass_extract_tip": "Extraire le mot de passe depuis le Base PKG",
+        "bp_my_list_settings": "Sélection des firmwares pour Ma liste",
+        "bp_pass_select_base": "Sélectionner le Base PKG",
+        "bp_pass_found": "Mot de passe trouvé : {}",
+        "bp_pass_not_found_title": "Mot de passe introuvable",
+        "bp_pass_not_found": "Impossible de déterminer le mot de passe.",
+        "ftp_search_placeholder": "Rechercher localement...",
+        "ftp_search_placeholder_remote": "Rechercher sur PS4...",
+        "recursive": "Récursif",
+        "ftp_searching": "🔎 Recherche en cours...",
+        "ctx_view_img": "🖼 Voir l'image",
+        "ctx_rename": "✏ Renommer",
+        "ctx_new_folder": "📁 Nouveau dossier",
+        "concurrent_installs": "Installations simultanées :",
+        "scan_folder": "Analyse du dossier...",
+        "add_files": "Ajout de {} fichiers...",
+        "scan_dropped_folders": "Analyse des dossiers déposés...",
+        "add_dropped_files": "Ajout de {} fichiers déposés...",
+        "tab_torrents": "Torrents et téléchargements",
+        "tab_console": "Console et services",
+        "tab_sender": "Expéditeur PKG",
+        "tab_ftp": "Gestionnaire FTP",
+        "tab_manager": "Gestionnaire PKG",
+        "tab_settings": "Paramètres",
+        "qbit_settings": "Paramètres qBittorrent",
+        "qbit_url": "URL de l'interface Web :",
+        "qbit_user": "Nom d'utilisateur :",
+        "qbit_pass": "Mot de passe :",
+        "qbit_local_dir": "Dossier de téléchargement local :",
+        "qbit_nas_dir": "Dossier distant dans qBittorrent (NAS) :",
+        "qbit_connect": "🔗 Connecter",
+        "qbit_add_torrent": "Lien magnet ou URL du torrent :",
+        "qbit_auto_install": "Installation automatique du PKG sur PS4 une fois terminé",
+        "qbit_btn_download": "📥 Télécharger",
+        "qbit_col_name": "Nom",
+        "qbit_col_size": "Taille",
+        "qbit_col_prog": "Progression",
+        "qbit_col_speed": "Vitesse",
+        "qbit_col_status": "Statut",
+        "qbit_col_actions": "Actions",
+        "torznab_search": "Recherche de torrents via Jackett / Prowlarr",
+        "torznab_url": "URL Torznab :",
+        "torznab_key": "Clé API :",
+        "torznab_query": "Rechercher un jeu ou un patch...",
+        "torznab_find": "🔍 Rechercher",
+        "console_refresh": "🔄 Actualiser la console",
+        "console_system_info": "Informations sur le système et le stockage",
+        "console_firmware": "Micrologiciel :",
+        "console_model": "Modèle PS4 :",
+        "console_hen": "Statut GoldHEN :",
+        "console_storage": "Stockage de la console",
+        "console_installed_apps": "Jeux et extensions installés sur PS4",
+        "console_uninstall_comp": "🗑 Supprimer le composant sélectionné",
+        "transport_mode": "Transport d'installation :",
+        "transport_rpi": "Remote Package Installer (Port 12800)",
+        "transport_payload": "DirectPackageInstaller Payload (Port 9090, avec icône et titre à l'écran)",
+        "transport_service": "PackegeFlowService (Port 12801)",
+        "unconfirmed_download": "⚠ Non confirmé (la PS4 ne télécharge pas)",
+        "unconfirmed_download_tooltip": "La PS4 a accepté la commande mais n'a pas demandé de données sur le réseau dans les 20 secondes. Vérifiez l'espace disque ou les téléchargements sur la PS4.",
+        "ftp_quick_jump": "Accès rapide PS4 :",
+        "ftp_send_to_queue": "➕ Ajouter le PKG à la file d'installation",
+        "ftp_nav_back": "⬅ Retour",
+        "ftp_nav_forward": "➡ Suivant",
+        "ftp_nav_up": "⬆ Dossier parent"
+    },
+    "zh": {
+        "window_title": f"STORM PS4 PKG SENDER v{CURRENT_VERSION}",
+        "confirm_uninstall": "确认卸载",
+        "msg_confirm_uninstall": "确定卸载 {} ({}) 吗？",
+        "ps4_ip": "PS4 IP:",
+        "check_conn": "🔗 检查连接",
+        "scan_net": "🌐 扫描网络",
+        "overwrite": "覆盖安装",
+        "hide_pinned": "隐藏已固定项",
+        "large_font": "大字体",
+        "backup_btn": "💾 备份存档",
+        "restore_btn": "♻ 恢复备份",
+        "btn_add_main": "➕ 添加",
+        "menu_add_files": "📄 文件 (.pkg / .bin)",
+        "menu_add_folder": "📁 文件夹",
+        "col_file": "文件 / 路径",
+        "col_tid": "ID / 类型",
+        "col_ver": "版本",
+        "col_size": "大小",
+        "col_region": "地区",
+        "col_category": "分类",
+        "col_speed": "传输速度",
+        "col_prog": "进度",
+        "col_status": "状态",
+        "col_act": "操作",
+        "collapse": "🔼 全部折叠",
+        "expand": "🔽 全部展开",
+        "pause_global": "⏸ 全部暂停",
+        "resume_global": "▶ 全部继续",
+        "cancel_all": "✖ 全部取消",
+        "install_all": "🚀 发送全部",
+        "waiting": "等待中...",
+        "ready": "就绪",
+        "server_off": "服务器: 已停止",
+        "server_ok": "服务器: {} (正常)",
+        "server_err": "服务器错误",
+        "status_offline": "离线",
+        "status_rpi_full": "在线 (RPI, FTP, BinLoader)",
+        "status_sppi_full": "在线 (SPPI, FTP, BinLoader)",
+        "status_ftp_bin": "在线 (FTP 与 BinLoader)",
+        "status_ftp_only": "在线 (仅 FTP)",
+        "status_bin_only": "在线 (仅 BinLoader)",
+        "checking": "检查中...",
+        "installing": "安装中...",
+        "sending_bin": "发送 Payload...",
+        "paused": "已暂停",
+        "error": "错误",
+        "cancelled": "已取消",
+        "installed": "已安装",
+        "sent_payload": "Payload 已发送",
+        "already": "已在主机中安装",
+        "sent": "链接已接收",
+        "not_installed": "未安装",
+        "queue_paused": "⏸ 队列已暂停",
+        "queue_resumed": "▶ 队列已恢复",
+        "scan_start": "🔍 正在局域网搜索 PS4...",
+        "scan_found": "✅ 找到 PS4: {}",
+        "scan_fail": "❌ 未在网络中找到 PS4",
+        "install_sel": "发送选中项 ({})",
+        "pin": "📌 固定",
+        "unpin": "❌ 取消固定",
+        "pin_sel": "📌 固定选中项 ({})",
+        "unpin_sel": "❌ 取消固定选中项 ({})",
+        "remove_list": "从列表中移除",
+        "copy": "📋 {} 已复制！",
+        "done": "已完成",
+        "sending": "发送中 {}%",
+        "skipped_no_space": "跳过，空间不足",
+        "busy": "PS4 忙碌 (Busy)",
+        "timeout": "连接超时",
+        "frozen": "RPI 无响应？请重启 PS4 应用",
+        "bkp_title": "存档备份设置",
+        "bkp_grp": "自动备份 (FTP)",
+        "bkp_enable": "启用自动备份",
+        "bkp_path": "保存文件夹:",
+        "bkp_int": "检查间隔:",
+        "bkp_run": "▶ 立即开始备份",
+        "bkp_info": "<i>* 需要 GoldHEN 运行中 (端口 2121)。<br>* 存档将按日期和时间归档保存。</i>",
+        "save": "保存",
+        "backport_tool": "降级工具 (Backport)",
+        "backport_ctx": "🔧 创建降级包 (PKG)",
+        "backport_error": "降级错误",
+        "backport_config_err": "请检查 tools 文件夹中是否存在 orbis-pub-cmd.exe。",
+        "icon_not_found": "未找到图标",
+        "icon_header_err": "文件头中未找到图标",
+        "icon_preview": "查看图标",
+        "ftp_warning_title": "注意！",
+        "ftp_warning_text": "在 FTP 浏览器中的所有修改均由您自行承担风险！\n开发者不对被删除的系统文件负责。",
+        "ftp_warning_chk": "不再显示",
+        "rename_wide": "新文件名:",
+        "cancel": "取消",
+        "rest_title": "向 PS4 恢复存档",
+        "rest_browse": "📂 选择备份",
+        "rest_send": "传输至 PS4",
+        "rest_col1": "用户 / Title ID",
+        "rest_col2": "文件路径",
+        "rest_success": "✅ 恢复成功！",
+        "rest_start": "🚀 开始恢复...",
+        "report_wait": "⏳ 完成。{} 秒后进行下一个...",
+        "confirm_title": "确认操作",
+        "confirm_cancel_all": "确定要取消所有任务吗？\n队列将被清空。",
+        "btn_yes": "确认",
+        "btn_no": "取消",
+        "yes": "是",
+        "no": "否",
+        "auto_update": "自动更新",
+        "upd_title": "有可用更新",
+        "upd_msg": "发现新版本: <b>{}</b><br>是否下载并安装更新？",
+        "status_online": "在线",
+        "upd_btn": "🚀 立即更新",
+        "upd_skip": "以后再说",
+        "upd_no_new": "✅ 已是最新版本",
+        "upd_err": "❌ 检查更新失败",
+        "upd_downloading": "📥 正在下载更新... {}%",
+        "stat_total": "总计: {} | 完成: {} | 错误: {}",
+        "stat_size": "大小: {} / {}",
+        "stat_eta": "剩余时间: {}",
+        "tray_show": "显示 / 隐藏",
+        "tray_exit": "退出",
+        "ctx_folder": "📂 在文件夹中打开",
+        "ctx_extract_icon": "🖼 提取图标",
+        "ctx_rename_pkg": "✏ 重命名 PKG",
+        "col_visibility": "显示/隐藏列",
+        "mini_mode": "迷你模式",
+        "logs_title": "📋 日志",
+        "logs_copy": "📋 复制",
+        "logs_clear": "🗑 清除",
+        "logs_close": "✖ 关闭",
+        "logs_empty": "(暂无日志)",
+        "logs_cleared": "(日志已清除)",
+        "ftp_pc": "电脑:",
+        "ftp_ps4": "PS4:",
+        "ftp_connect": "🔗 连接",
+        "ftp_disconnect": "❌ 断开",
+        "ftp_upload": "➡ 上传",
+        "ftp_download": "⬅ 下载",
+        "ftp_mkdir": "📁 新建文件夹",
+        "ftp_delete": "❌ 删除",
+        "ftp_name": "名称",
+        "ftp_size": "大小",
+        "ftp_date": "日期",
+        "ftp_refresh": "刷新",
+        "pkg_connect": "🔗 连接管理",
+        "pkg_refresh": "🔄 刷新",
+        "pkg_launch": "🚀 运行",
+        "pkg_uninstall": "🗑 卸载",
+        "pkg_title": "标题",
+        "pkg_tid": "Title ID",
+        "pkg_ver": "版本",
+        "pkg_size": "大小",
+        "bp_title": "降级工具 (Backport)",
+        "bp_my_list": "自定义列表",
+        "bp_all_fw": "所有固件版本",
+        "bp_target": "目标: {}",
+        "bp_fw": "选择目标固件:",
+        "bp_save": "保存文件夹:",
+        "bp_start": "开始",
+        "bp_browse": "浏览",
+        "ctx_change_title": "✏ 修改显示名称",
+        "change_title": "修改名称",
+        "new_title": "新名称:",
+        "ok": "确定",
+        "confirm_exit_text": "关闭程序还是最小化到系统托盘？",
+        "btn_exit": "关闭",
+        "btn_tray": "最小化到托盘",
+        "bp_pass_title": "输入 PKG 密码 (Passcode)",
+        "bp_pass_info": "PKG 文件已加密。\n请输入 32 位密码:",
+        "bp_pass_extract": "提取",
+        "bp_pass_extract_tip": "从 Base PKG 提取密码",
+        "bp_my_list_settings": "自定义固件版本列表设置",
+        "bp_pass_select_base": "选择 Base PKG",
+        "bp_pass_found": "找到密码: {}",
+        "bp_pass_not_found_title": "未找到密码",
+        "bp_pass_not_found": "未能获取密码。",
+        "ftp_search_placeholder": "本地搜索...",
+        "ftp_search_placeholder_remote": "在 PS4 上搜索...",
+        "recursive": "递归搜索",
+        "ftp_searching": "🔎 正在搜索...",
+        "ctx_view_img": "🖼 查看图片",
+        "ctx_rename": "✏ 重命名",
+        "ctx_new_folder": "📁 新建文件夹",
+        "concurrent_installs": "并发安装数量:",
+        "scan_folder": "正在扫描文件夹...",
+        "add_files": "正在添加 {} 个文件...",
+        "scan_dropped_folders": "正在扫描拖入的文件夹...",
+        "add_dropped_files": "正在添加 {} 个拖入的文件...",
+        "tab_torrents": "种子与下载",
+        "tab_console": "主机与服务",
+        "tab_sender": "PKG 发送器",
+        "tab_ftp": "FTP 浏览器",
+        "tab_manager": "PKG 管理器",
+        "tab_settings": "设置",
+        "qbit_settings": "qBittorrent 设置",
+        "qbit_url": "Web UI 网址：",
+        "qbit_user": "用户名：",
+        "qbit_pass": "密码：",
+        "qbit_local_dir": "本地下载文件夹：",
+        "qbit_nas_dir": "qBittorrent 中的远程文件夹 (NAS)：",
+        "qbit_connect": "🔗 连接",
+        "qbit_add_torrent": "磁力链接或种子网址：",
+        "qbit_auto_install": "下载完成后自动在 PS4 上安装 PKG",
+        "qbit_btn_download": "📥 下载",
+        "qbit_col_name": "名称",
+        "qbit_col_size": "大小",
+        "qbit_col_prog": "进度",
+        "qbit_col_speed": "速度",
+        "qbit_col_status": "状态",
+        "qbit_col_actions": "操作",
+        "torznab_search": "通过 Jackett / Prowlarr 搜索种子",
+        "torznab_url": "Torznab 网址：",
+        "torznab_key": "API 密钥：",
+        "torznab_query": "搜索游戏或补丁...",
+        "torznab_find": "🔍 搜索",
+        "console_refresh": "🔄 刷新主机",
+        "console_system_info": "系统与存储信息",
+        "console_firmware": "固件版本：",
+        "console_model": "PS4 型号：",
+        "console_hen": "GoldHEN 状态：",
+        "console_storage": "主机存储空间",
+        "console_installed_apps": "PS4 上已安装的游戏与附加内容",
+        "console_uninstall_comp": "🗑 删除所选组件",
+        "transport_mode": "安装传输协议：",
+        "transport_rpi": "Remote Package Installer (端口 12800)",
+        "transport_payload": "DirectPackageInstaller Payload (端口 9090，带屏幕图标和标题)",
+        "transport_service": "PackegeFlowService (端口 12801)",
+        "unconfirmed_download": "⚠ 未确认 (PS4 未开始下载)",
+        "unconfirmed_download_tooltip": "PS4 已接收任务，但在 20 秒内未通过网络请求数据。请检查 PS4 存储空间或主机上的下载错误通知。",
+        "ftp_quick_jump": "PS4 快捷路径：",
+        "ftp_send_to_queue": "➕ 将 PKG 添加到安装队列",
+        "ftp_nav_back": "⬅ 后退",
+        "ftp_nav_forward": "➡ 前进",
+        "ftp_nav_up": "⬆ 上级目录"
+    },
+    "ja": {
+        "window_title": f"STORM PS4 PKG SENDER v{CURRENT_VERSION}",
+        "confirm_uninstall": "アンインストールの確認",
+        "msg_confirm_uninstall": "{} ({}) をアンインストールしますか？",
+        "ps4_ip": "PS4 IP:",
+        "check_conn": "🔗 接続確認",
+        "scan_net": "🌐 ネットワーク検索",
+        "overwrite": "上書きインストール",
+        "hide_pinned": "ピン留め項目を非表示",
+        "large_font": "大きなフォント",
+        "backup_btn": "💾 セーブデータバックアップ",
+        "restore_btn": "♻ バックアップの復元",
+        "btn_add_main": "➕ 追加",
+        "menu_add_files": "📄 ファイル (.pkg / .bin)",
+        "menu_add_folder": "📁 フォルダ",
+        "col_file": "ファイル / パス",
+        "col_tid": "ID / タイプ",
+        "col_ver": "バージョン",
+        "col_size": "サイズ",
+        "col_region": "リージョン",
+        "col_category": "カテゴリ",
+        "col_speed": "速度",
+        "col_prog": "進捗",
+        "col_status": "ステータス",
+        "col_act": "操作",
+        "collapse": "🔼 すべて折りたたむ",
+        "expand": "🔽 すべて展開",
+        "pause_global": "⏸ すべて一時停止",
+        "resume_global": "▶ すべて再開",
+        "cancel_all": "✖ すべてキャンセル",
+        "install_all": "🚀 すべて送信",
+        "waiting": "待機中...",
+        "ready": "準備完了",
+        "server_off": "サーバー: 停止",
+        "server_ok": "サーバー: {} (正常)",
+        "server_err": "サーバーエラー",
+        "status_offline": "オフライン",
+        "status_rpi_full": "オンライン (RPI, FTP, BinLoader)",
+        "status_sppi_full": "オンライン (SPPI, FTP, BinLoader)",
+        "status_ftp_bin": "オンライン (FTP および BinLoader)",
+        "status_ftp_only": "オンライン (FTP のみ)",
+        "status_bin_only": "オンライン (BinLoader のみ)",
+        "checking": "確認中...",
+        "installing": "インストール中...",
+        "sending_bin": "ペイロード送信中...",
+        "paused": "一時停止中",
+        "error": "エラー",
+        "cancelled": "キャンセル済み",
+        "installed": "インストール済み",
+        "sent_payload": "ペイロード送信完了",
+        "already": "本体にインストール済み",
+        "sent": "リンク受信完了",
+        "not_installed": "未インストール",
+        "queue_paused": "⏸ キュー一時停止",
+        "queue_resumed": "▶ キュー再開",
+        "scan_start": "🔍 ネットワーク上の PS4 を検索中...",
+        "scan_found": "✅ PS4 を検出: {}",
+        "scan_fail": "❌ PS4 が見つかりませんでした",
+        "install_sel": "選択項目を送信 ({})",
+        "pin": "📌 ピン留め",
+        "unpin": "❌ ピン留め解除",
+        "pin_sel": "📌 選択項目をピン留め ({})",
+        "unpin_sel": "❌ 選択項目のピン留めを解除 ({})",
+        "remove_list": "リストから削除",
+        "copy": "📋 {} をコピーしました！",
+        "done": "完了",
+        "sending": "送信中 {}%",
+        "skipped_no_space": "スキップ (空き容量不足)",
+        "busy": "PS4 がビジー状態です",
+        "timeout": "接続タイムアウト",
+        "frozen": "RPI が応答しません。PS4 アプリを再起動してください",
+        "bkp_title": "バックアップ設定",
+        "bkp_grp": "自動バックアップ (FTP)",
+        "bkp_enable": "自動バックアップを有効化",
+        "bkp_path": "保存先フォルダ:",
+        "bkp_int": "確認間隔:",
+        "bkp_run": "▶ 今すぐバックアップ",
+        "bkp_info": "<i>* GoldHEN (ポート 2121) が起動している必要があります。<br>* 日時ごとのフォルダに保存されます。</i>",
+        "save": "保存",
+        "backport_tool": "バックポートツール",
+        "backport_ctx": "🔧 バックポート作成 (PKG)",
+        "backport_error": "バックポートエラー",
+        "backport_config_err": "tools フォルダに orbis-pub-cmd.exe があるか確認してください。",
+        "icon_not_found": "アイコンが見つかりません",
+        "icon_header_err": "ヘッダー内にアイコンが見つかりません",
+        "icon_preview": "アイコンプレビュー",
+        "ftp_warning_title": "警告！",
+        "ftp_warning_text": "FTP ブラウザでの変更はすべて自己責任で行ってください！\nシステムファイルの削除について開発者は責任を負いません。",
+        "ftp_warning_chk": "次回から表示しない",
+        "rename_wide": "新しいファイル名:",
+        "cancel": "キャンセル",
+        "rest_title": "PS4 へセーブデータを復元",
+        "rest_browse": "📂 バックアップを選択",
+        "rest_send": "PS4 へ転送",
+        "rest_col1": "ユーザー / Title ID",
+        "rest_col2": "ファイルパス",
+        "rest_success": "✅ 復元が正常に完了しました！",
+        "rest_start": "🚀 復元を開始します...",
+        "report_wait": "⏳ 完了。{} 秒後に次を処理...",
+        "confirm_title": "確認",
+        "confirm_cancel_all": "すべてのタスクをキャンセルしますか？\nキューは空になります。",
+        "btn_yes": "確認",
+        "btn_no": "キャンセル",
+        "yes": "はい",
+        "no": "いいえ",
+        "auto_update": "自動更新",
+        "upd_title": "アップデート利用可能",
+        "upd_msg": "新しいバージョンがあります: <b>{}</b><br>アップデートをダウンロードしてインストールしますか？",
+        "status_online": "オンライン",
+        "upd_btn": "🚀 今すぐアップデート",
+        "upd_skip": "後で",
+        "upd_no_new": "✅ 最新バージョンがインストールされています",
+        "upd_err": "❌ アップデート確認エラー",
+        "upd_downloading": "📥 アップデートをダウンロード中... {}%",
+        "stat_total": "合計: {} | 完了: {} | エラー: {}",
+        "stat_size": "サイズ: {} / {}",
+        "stat_eta": "残り時間: {}",
+        "tray_show": "表示 / 非表示",
+        "tray_exit": "終了",
+        "ctx_folder": "📂 フォルダで開く",
+        "ctx_extract_icon": "🖼 アイコンを抽出",
+        "ctx_rename_pkg": "✏ PKG の名前変更",
+        "col_visibility": "列の表示/非表示",
+        "mini_mode": "コンパクトモード",
+        "logs_title": "📋 ログ",
+        "logs_copy": "📋 コピー",
+        "logs_clear": "🗑 クリア",
+        "logs_close": "✖ 閉じる",
+        "logs_empty": "(ログはありません)",
+        "logs_cleared": "(ログをクリアしました)",
+        "ftp_pc": "PC:",
+        "ftp_ps4": "PS4:",
+        "ftp_connect": "🔗 接続",
+        "ftp_disconnect": "❌ 切断",
+        "ftp_upload": "➡ アップロード",
+        "ftp_download": "⬅ ダウンロード",
+        "ftp_mkdir": "📁 新規フォルダ",
+        "ftp_delete": "❌ 削除",
+        "ftp_name": "名前",
+        "ftp_size": "サイズ",
+        "ftp_date": "日時",
+        "ftp_refresh": "更新",
+        "pkg_connect": "🔗 接続管理",
+        "pkg_refresh": "🔄 更新",
+        "pkg_launch": "🚀 起動",
+        "pkg_uninstall": "🗑 アンインストール",
+        "pkg_title": "タイトル",
+        "pkg_tid": "Title ID",
+        "pkg_ver": "バージョン",
+        "pkg_size": "サイズ",
+        "bp_title": "バックポートツール",
+        "bp_my_list": "カスタムリスト",
+        "bp_all_fw": "すべてのファームウェア",
+        "bp_target": "ターゲット: {}",
+        "bp_fw": "ファームウェアを選択:",
+        "bp_save": "保存先フォルダ:",
+        "bp_start": "開始",
+        "bp_browse": "参照",
+        "ctx_change_title": "✏ 表示名の変更",
+        "change_title": "名前の変更",
+        "new_title": "新しい名前:",
+        "ok": "OK",
+        "confirm_exit_text": "アプリケーションを終了しますか、それともトレイに最小化しますか？",
+        "btn_exit": "終了",
+        "btn_tray": "トレイへ最小化",
+        "bp_pass_title": "PKG パスコード入力",
+        "bp_pass_info": "PKG ファイルは暗号化されています。\n32文字のパスコードを入力してください:",
+        "bp_pass_extract": "抽出",
+        "bp_pass_extract_tip": "Base PKG からパスコードを抽出",
+        "bp_my_list_settings": "カスタムファームウェア一覧設定",
+        "bp_pass_select_base": "Base PKG を選択",
+        "bp_pass_found": "パスコードを検出: {}",
+        "bp_pass_not_found_title": "パスコードが見つかりません",
+        "bp_pass_not_found": "パスコードを取得できませんでした。",
+        "ftp_search_placeholder": "ローカル検索...",
+        "ftp_search_placeholder_remote": "PS4 内を検索...",
+        "recursive": "再帰的検索",
+        "ftp_searching": "🔎 検索中...",
+        "ctx_view_img": "🖼 画像を表示",
+        "ctx_rename": "✏ 名前変更",
+        "ctx_new_folder": "📁 新規フォルダ",
+        "concurrent_installs": "同時インストール数:",
+        "scan_folder": "フォルダをスキャン中...",
+        "add_files": "{} 個のファイルを追加中...",
+        "scan_dropped_folders": "ドロップされたフォルダをスキャン中...",
+        "add_dropped_files": "{} 個のドロップされたファイルを追加中...",
+        "tab_torrents": "トレントとダウンロード",
+        "tab_console": "本体とサービス",
+        "tab_sender": "PKG送信機",
+        "tab_ftp": "FTPブラウザ",
+        "tab_manager": "PKGマネージャー",
+        "tab_settings": "設定",
+        "qbit_settings": "qBittorrent 設定",
+        "qbit_url": "Web UIのURL:",
+        "qbit_user": "ユーザー名:",
+        "qbit_pass": "パスワード:",
+        "qbit_local_dir": "PCのダウンロードフォルダ:",
+        "qbit_nas_dir": "qBittorrent内のリモートフォルダ (NAS):",
+        "qbit_connect": "🔗 接続",
+        "qbit_add_torrent": "マグネットリンクまたはトレントURL:",
+        "qbit_auto_install": "完了時にPS4へPKGを自動インストール",
+        "qbit_btn_download": "📥 ダウンロード",
+        "qbit_col_name": "名前",
+        "qbit_col_size": "サイズ",
+        "qbit_col_prog": "進捗",
+        "qbit_col_speed": "速度",
+        "qbit_col_status": "ステータス",
+        "qbit_col_actions": "アクション",
+        "torznab_search": "Jackett / Prowlarr 経由でトレントを検索",
+        "torznab_url": "Torznab URL:",
+        "torznab_key": "APIキー:",
+        "torznab_query": "ゲームまたはパッチを検索...",
+        "torznab_find": "🔍 検索",
+        "console_refresh": "🔄 本体を更新",
+        "console_system_info": "システムとストレージ情報",
+        "console_firmware": "ファームウェア:",
+        "console_model": "PS4モデル:",
+        "console_hen": "GoldHENステータス:",
+        "console_storage": "本体ストレージ",
+        "console_installed_apps": "PS4にインストール済みのゲームと追加コンテンツ",
+        "console_uninstall_comp": "🗑 選択したコンポーネントを削除",
+        "transport_mode": "インストール転送モード:",
+        "transport_rpi": "Remote Package Installer (ポート 12800)",
+        "transport_payload": "DirectPackageInstaller Payload (ポート 9090、画面アイコンとタイトル付き)",
+        "transport_service": "PackegeFlowService (ポート 12801)",
+        "unconfirmed_download": "⚠ 未確認 (PS4がダウンロードしていません)",
+        "unconfirmed_download_tooltip": "PS4はタスクを受け付けましたが、20秒以内にネットワーク経由でデータを要求しませんでした。PS4の空き容量またはダウンロードエラーを確認してください。",
+        "ftp_quick_jump": "PS4クイック移動:",
+        "ftp_send_to_queue": "➕ PKGをインストールキューに追加",
+        "ftp_nav_back": "⬅ 戻る",
+        "ftp_nav_forward": "➡ 進む",
+        "ftp_nav_up": "⬆ 上へ"
     }
 }
-
 # --- STYLES & THEMES ---
 ICON_BTN_STYLE = """
     QPushButton#iconBtn { background-color: rgba(128, 128, 128, 0.2); border: 1px solid #888; border-radius: 4px; }
@@ -749,6 +1810,47 @@ THEMES = {
         "bg": "#f0f2f5", "fg": "#1c1e21", "input_bg": "#ffffff", "input_fg": "#000000", 
         "input_border": "#1877f2", "btn_bg": "#e4e6eb", "btn_fg": "#050505", 
         "tree_bg": "#ffffff", "tree_alt": "#f7f8fa", "header_bg": "#ffffff", "type": "light" 
+    },
+    # --- STORM SOFT ECOSYSTEM THEMES (NEW) ---
+    "STORM DARK": { 
+        "bg": "#10141d", "fg": "#f1f5f9", "input_bg": "#1e293b", "input_fg": "#ffffff", 
+        "input_border": "#00d2ff", "btn_bg": "#1e293b", "btn_fg": "#00d2ff", 
+        "tree_bg": "#0f172a", "tree_alt": "#162035", "header_bg": "#1e293b", "type": "dark" 
+    },
+    "STORM NIGHT": { 
+        "bg": "#0a0b10", "fg": "#f8fafc", "input_bg": "#12141c", "input_fg": "#ffffff", 
+        "input_border": "#00f0ff", "btn_bg": "#151824", "btn_fg": "#00f0ff", 
+        "tree_bg": "#0a0b10", "tree_alt": "#10131d", "header_bg": "#12141c", "type": "dark" 
+    },
+    "STORM DAY": { 
+        "bg": "#f8fafc", "fg": "#0f172a", "input_bg": "#ffffff", "input_fg": "#0f172a", 
+        "input_border": "#0284c7", "btn_bg": "#e2e8f0", "btn_fg": "#0284c7", 
+        "tree_bg": "#ffffff", "tree_alt": "#f1f5f9", "header_bg": "#e2e8f0", "type": "light" 
+    },
+    "STORM MIDNIGHT": { 
+        "bg": "#15112b", "fg": "#f3e8ff", "input_bg": "#1f1940", "input_fg": "#ffffff", 
+        "input_border": "#a855f7", "btn_bg": "#271f52", "btn_fg": "#a855f7", 
+        "tree_bg": "#15112b", "tree_alt": "#1a1536", "header_bg": "#1f1940", "type": "dark" 
+    },
+    "STORM MATRIX": { 
+        "bg": "#051108", "fg": "#00ff66", "input_bg": "#0b1f10", "input_fg": "#00ff66", 
+        "input_border": "#00ff66", "btn_bg": "#0e2915", "btn_fg": "#00ff66", 
+        "tree_bg": "#051108", "tree_alt": "#08170b", "header_bg": "#0b1f10", "type": "dark" 
+    },
+    "STORM CYBERPUNK": { 
+        "bg": "#0f051d", "fg": "#ff007f", "input_bg": "#1c0a36", "input_fg": "#00f0ff", 
+        "input_border": "#ff007f", "btn_bg": "#280f4d", "btn_fg": "#ff007f", 
+        "tree_bg": "#0f051d", "tree_alt": "#16072b", "header_bg": "#1c0a36", "type": "dark" 
+    },
+    "STORM FANTASY": { 
+        "bg": "#120e07", "fg": "#f59e0b", "input_bg": "#21190c", "input_fg": "#fef3c7", 
+        "input_border": "#f59e0b", "btn_bg": "#2d2210", "btn_fg": "#f59e0b", 
+        "tree_bg": "#120e07", "tree_alt": "#1a140a", "header_bg": "#21190c", "type": "dark" 
+    },
+    "STORM WARHAMMER 40K": { 
+        "bg": "#141416", "fg": "#d4af37", "input_bg": "#212126", "input_fg": "#f5e6b3", 
+        "input_border": "#d4af37", "btn_bg": "#2a2a30", "btn_fg": "#d4af37", 
+        "tree_bg": "#141416", "tree_alt": "#1b1b1e", "header_bg": "#212126", "type": "dark" 
     }
 }
 
@@ -937,7 +2039,8 @@ def get_pkg_info_from_sfo(sfo_data):
         "TITLE": parser.get("TITLE") or parser.get("Title"), 
         "TITLE_ID": parser.get("TITLE_ID") or parser.get("Title_ID"), 
         "APP_VER": parser.get("APP_VER") or parser.get("App_Ver"),
-        "CATEGORY": parser.get("CATEGORY") or parser.get("Category")
+        "CATEGORY": parser.get("CATEGORY") or parser.get("Category"),
+        "CONTENT_ID": parser.get("CONTENT_ID") or parser.get("Content_ID")
     }
 
 
@@ -958,8 +2061,9 @@ class GridDelegate(QStyledItemDelegate):
         painter.restore()
 
 class CenterDelegate(QStyledItemDelegate):
-    def paint(self, painter, option, index):
-        option.displayAlignment = Qt.AlignmentFlag.AlignCenter; super().paint(painter, option, index)
+    def initStyleOption(self, option, index):
+        super().initStyleOption(option, index)
+        option.displayAlignment = Qt.AlignmentFlag.AlignCenter
 
 class FTPItem(QTreeWidgetItem):
     def __init__(self, data):
@@ -1160,6 +2264,8 @@ class PS4HTTPHandler(SimpleHTTPRequestHandler):
             
             range_header = self.headers.get('Range')
             if range_header:
+                if file_key:
+                    LAST_RANGE_REQUEST_TIME[str(file_key)] = time.time()
                 # Removed verbose range logging to reduce spam
                 # log(f"GET Range Request: {range_header} for {self.path}", "DEBUG")
                 try:
@@ -1229,18 +2335,8 @@ class PS4HTTPHandler(SimpleHTTPRequestHandler):
                     # 1MB chunks caused 10053 disconnects on some systems (buffer overflow/latency).
                     # 128KB-256KB is the sweet spot for Windows socket speeds without blocking kernel.
                     
-                    is_tiny_file = (file_size < 1024 * 1024) # < 1MB
-                    
-                    if is_tiny_file:
-                        # Only throttle extremely small files to avoid PS4 connection spam
-                        read_size = min(32768, chunk_len - bytes_sent)
-                        time.sleep(0.001) # Micro sleep
-                    else:
-                        # 256KB chunks = Balance between CPU calls and Network Throughput
-                        read_size = min(262144, chunk_len - bytes_sent) 
-                        # Micro-yield every 2MB to keep system responsive during heavy concurrent load
-                        if checks_counter % 8 == 0:
-                             time.sleep(0.001)
+                    # 256KB chunks = Optimal balance for gigabit throughput and socket streaming
+                    read_size = min(262144, chunk_len - bytes_sent)
                     
                     chunk = f.read(read_size)
                     if not chunk: break
@@ -1291,70 +2387,106 @@ def format_size(size_bytes):
     return f"{p:.2f} {size_name[i]}".replace('.', ',')
 
 def parse_pkg_info(filepath):
+    """High-performance PKG header & entry table parser (seek-based, avoiding large memory reads)."""
     tid, ver, region, category = "Unknown", "01.00", "-", "-"
     if filepath.lower().endswith(".bin"):
         return "PAYLOAD", "-", "-", "PAYLOAD"
-        
+
+    filename_lower = os.path.basename(filepath).lower()
+    if '_dlc_' in filename_lower or 'dlc' in filename_lower or 'addcont' in filename_lower or 'season' in filename_lower:
+        category = "DLC"
+    elif '_patch_' in filename_lower or 'patch' in filename_lower or 'update' in filename_lower or 'backport' in filename_lower or 'fix' in filename_lower:
+        category = "UPDATE"
+
     try:
-        filename_lower = os.path.basename(filepath).lower()
-        
         with open(filepath, 'rb') as f:
-            # Read first 32MB to find SFO and other data
-            data = f.read(32 * 1024 * 1024) 
-            
-            # 1. Detect Category from filename/binary as FALLBACK
-            if '_dlc_' in filename_lower or 'dlc' in filename_lower or 'addcont' in filename_lower or 'season' in filename_lower:
-                category = "DLC"
-            elif '_patch_' in filename_lower or 'patch' in filename_lower or 'update' in filename_lower or 'backport' in filename_lower or 'fix' in filename_lower:
-                category = "UPDATE"
-            elif b'ac.pkg' in data[:0x1000] or b'addcont' in data[:0x5000]:
-                category = "DLC"
-            elif b'patch' in data[:0x5000]:
-                category = "UPDATE"
-            
-            # 2. Extract Region from Content ID
-            m_cid = re.search(rb'([UEJAHIK][PSCN]\d{4})-([A-Z]{4}\d{5})_00', data)
-            if m_cid:
-                region_code = m_cid.group(1).decode('ascii')[:2]
-                region_map = {'UP': 'US', 'EP': 'EU', 'JP': 'JP', 'HP': 'HK', 'AS': 'AS', 'KP': 'KR'}
-                region = region_map.get(region_code, region_code)
+            header = f.read(4096)
+            if len(header) >= 0x100:
+                magic = header[:4]
+                # 1. Standard Sony Orbis PKG format
+                if magic == b'\x7fCNT':
+                    cid_bytes = header[0x40:0x64]
+                    try:
+                        cid_str = cid_bytes.decode('ascii', errors='ignore').strip('\x00')
+                        m_cid = re.search(r'([UEJAHIK][PSCN]\d{4})-([A-Z]{4}\d{5})_00', cid_str)
+                        if m_cid:
+                            region_code = m_cid.group(1)[:2]
+                            region_map = {'UP': 'US', 'EP': 'EU', 'JP': 'JP', 'HP': 'HK', 'AS': 'AS', 'KP': 'KR'}
+                            region = region_map.get(region_code, region_code)
+                            tid = m_cid.group(2).upper()
+                    except Exception:
+                        pass
 
-            # 3. SFO Ground Truth (Highest Priority)
-            offset = 0
-            while True:
-                sfo_offset = data.find(b'\x00PSF', offset)
-                if sfo_offset == -1: break
-                try:
-                    sfo_data = data[sfo_offset : sfo_offset + 5000] 
-                    sfo_info = get_pkg_info_from_sfo(sfo_data)
-                    found_tid = sfo_info.get("TITLE_ID")
-                    found_ver = sfo_info.get("APP_VER")
-                    sfo_cat = sfo_info.get("CATEGORY")
-                    
-                    if found_tid: tid = found_tid.strip().upper()
-                    if found_ver: ver = found_ver
-                    
-                    if sfo_cat:
-                        s_cat = sfo_cat.lower()
-                        if s_cat == "gd": category = "GAME"
-                        elif s_cat == "gp": category = "UPDATE"
-                        elif s_cat == "ac": category = "DLC"
-                        elif s_cat == "sd": category = "THEME"
-                except: pass
-                offset = sfo_offset + 4 
+                    entry_count = struct.unpack_from('>I', header, 0x10)[0]
+                    table_offset = struct.unpack_from('>I', header, 0x18)[0]
 
-            # Final Regex Fallback for TID if SFO failed
-            if tid == "Unknown":
-                m_tid = re.search(rb'(CUSA\d{5}|PPSA\d{5})', data)
-                if m_tid: tid = m_tid.group(1).decode('ascii').upper()
-            
-            if category == "-" and (tid.startswith('CUSA') or tid.startswith('PPSA')):
-                category = "GAME"
-            elif category == "-":
-                category = "APP"
+                    if 0 < entry_count < 2000 and 0 < table_offset < 100 * 1024 * 1024:
+                        f.seek(table_offset)
+                        table_data = f.read(entry_count * 32)
+                        for i in range(entry_count):
+                            entry_bytes = table_data[i * 32 : (i + 1) * 32]
+                            if len(entry_bytes) < 32: break
+                            entry_id = struct.unpack_from('>I', entry_bytes, 0)[0]
+                            if entry_id == 0x1000: # param.sfo
+                                sfo_off = struct.unpack_from('>I', entry_bytes, 16)[0]
+                                sfo_sz = struct.unpack_from('>I', entry_bytes, 20)[0]
+                                if 0 < sfo_sz < 256 * 1024:
+                                    f.seek(sfo_off)
+                                    sfo_data = f.read(sfo_sz)
+                                    sfo_info = get_pkg_info_from_sfo(sfo_data)
+                                    found_tid = sfo_info.get("TITLE_ID")
+                                    found_ver = sfo_info.get("APP_VER")
+                                    sfo_cat = sfo_info.get("CATEGORY")
+                                    if found_tid: tid = found_tid.strip().upper()
+                                    if found_ver: ver = found_ver
+                                    if sfo_cat:
+                                        s_cat = sfo_cat.lower()
+                                        if s_cat == "gd": category = "GAME"
+                                        elif s_cat == "gp": category = "UPDATE"
+                                        elif s_cat == "ac": category = "DLC"
+                                        elif s_cat == "sd": category = "THEME"
+                                break
 
-    except Exception as e: 
-        print(f"Error parsing {filepath}: {e}")
+            # 2. Fast Fallback if SFO not resolved: scan first 2MB (NOT 32MB)
+            if tid == "Unknown" or category == "-":
+                f.seek(0)
+                data = f.read(2 * 1024 * 1024)
+                m_cid = re.search(rb'([UEJAHIK][PSCN]\d{4})-([A-Z]{4}\d{5})_00', data)
+                if m_cid:
+                    region_code = m_cid.group(1).decode('ascii')[:2]
+                    region_map = {'UP': 'US', 'EP': 'EU', 'JP': 'JP', 'HP': 'HK', 'AS': 'AS', 'KP': 'KR'}
+                    region = region_map.get(region_code, region_code)
+
+                sfo_offset = data.find(b'\x00PSF')
+                if sfo_offset != -1:
+                    try:
+                        sfo_data = data[sfo_offset : sfo_offset + 16384]
+                        sfo_info = get_pkg_info_from_sfo(sfo_data)
+                        found_tid = sfo_info.get("TITLE_ID")
+                        found_ver = sfo_info.get("APP_VER")
+                        sfo_cat = sfo_info.get("CATEGORY")
+                        if found_tid: tid = found_tid.strip().upper()
+                        if found_ver: ver = found_ver
+                        if sfo_cat:
+                            s_cat = sfo_cat.lower()
+                            if s_cat == "gd": category = "GAME"
+                            elif s_cat == "gp": category = "UPDATE"
+                            elif s_cat == "ac": category = "DLC"
+                            elif s_cat == "sd": category = "THEME"
+                    except Exception:
+                        pass
+
+                if tid == "Unknown":
+                    m_tid = re.search(rb'(CUSA\d{5}|PPSA\d{5})', data)
+                    if m_tid: tid = m_tid.group(1).decode('ascii').upper()
+
+        if category == "-" and (tid.startswith('CUSA') or tid.startswith('PPSA')):
+            category = "GAME"
+        elif category == "-":
+            category = "APP"
+
+    except Exception as e:
+        log(f"Error parsing PKG {filepath}: {e}", "WARN")
     return tid, ver, region, category
 # --- THREAD CLASSES ---
 
@@ -1795,14 +2927,7 @@ class FirmwareSelectDialog(QDialog):
         layout.addWidget(lbl)
         
         self.fw_combo = QComboBox()
-        # Full List as requested
-        full_fws = [
-            "5.05", "5.07", "6.50", "6.71", "6.72", "7.00", "7.02", "7.35", 
-            "7.50", "7.55", "8.00", "8.52", "9.00", "9.03", "9.60", "10.00", 
-            "10.71", "11.00", "11.02", "11.52", "12.00", "12.02", "12.50", 
-            "12.52", "13.00", "13.02"
-        ]
-        self.fw_combo.addItems(full_fws)
+        self.fw_combo.addItems(SUPPORTED_FIRMWARES)
         layout.addWidget(self.fw_combo)
         
         # Load saved selection if exists
@@ -2132,15 +3257,8 @@ class ElfPatcher:
         self.patch_count = 0
 
     def _fw_to_hex(self, fw_ver):
-        """Convert '5.05' -> 0x05050000"""
-        try:
-            parts = fw_ver.split('.')
-            major = int(parts[0])
-            minor = int(parts[1]) if len(parts) > 1 else 0
-            # format: MM mm 00 00
-            return (major << 24) | (minor << 16)
-        except:
-            return 0x05050000 # Default fallback
+        """Convert '5.05' -> 0x05050000, '14.00' -> 0x0E000000"""
+        return fw_version_to_int(fw_ver)
 
     def patch_file(self, file_path):
         """Scans an ELF file and patches the SDK version in PT_NOTE."""
@@ -2359,13 +3477,7 @@ class BackportDialog(QDialog):
         layout.addWidget(QLabel(self.t("bp_fw")))
         
         self.fw_combo = QComboBox()
-        # FIX: Full list of firmwares as requested
-        self.fw_list = [
-            "5.05", "5.07", "6.50", "6.71", "6.72", "7.00", "7.02", "7.35", 
-            "7.50", "7.55", "8.00", "8.52", "9.00", "9.03", "9.60", "10.00", 
-            "10.71", "11.00", "11.02", "11.52", "12.00", "12.02", "12.50", 
-            "12.52", "13.00", "13.02"
-        ]
+        self.fw_list = list(SUPPORTED_FIRMWARES)
         
         # Labels for dropdown
         items = [self.t("bp_my_list"), self.t("bp_all_fw")] + self.fw_list
@@ -2525,8 +3637,31 @@ class MainWindow(QMainWindow):
         super().__init__()
         # hide_console()  # Disabled per user request
         self.settings = QSettings("StormApp", "STORM_v1215")
-        self.current_lang = self.settings.value("language", "ru")
+        # Language Detection & Initialization (System Language on first run)
+        def detect_system_language():
+            try:
+                sys_locale = QLocale.system().name().lower()
+                if sys_locale.startswith(("ru", "be", "uk", "kk")):
+                    return "ru"
+                elif sys_locale.startswith("de"):
+                    return "de"
+                elif sys_locale.startswith("fr"):
+                    return "fr"
+                elif sys_locale.startswith("zh"):
+                    return "zh"
+                elif sys_locale.startswith("ja"):
+                    return "ja"
+            except Exception:
+                pass
+            return "en"
+
+        saved_lang = self.settings.value("language", None)
+        if saved_lang and saved_lang in LOCALE:
+            self.current_lang = saved_lang
+        else:
+            self.current_lang = detect_system_language()
         self.setWindowTitle(LOCALE[self.current_lang]["window_title"])
+        self.item_by_key = {}
         
         try:
             icon_path = resource_path("stormps4pkgsender.ico")
@@ -2708,10 +3843,12 @@ class MainWindow(QMainWindow):
         
         self.sidebar_buttons = []
         sidebar_items = [
-             ("📦", "PKG Sender", 0),
-             ("📁", "FTP Browser", 1),
-             ("🗑", "PKG Manager", 2),
-             ("⚙", "Settings", 3),
+             ("📦", self.t("tab_sender"), 0),
+             ("📁", self.t("tab_ftp"), 1),
+             ("🗑", self.t("tab_manager"), 2),
+             ("🧲", self.t("tab_torrents"), 3),
+             ("🎮", self.t("tab_console"), 4),
+             ("⚙", self.t("tab_settings"), 5),
         ]
         
         for icon, tooltip, page_idx in sidebar_items:
@@ -2773,7 +3910,17 @@ class MainWindow(QMainWindow):
         self.init_pkg_manager_ui()
         self.page_stack.addWidget(self.pkg_manager_page)
         
-        # Page 3: Settings
+        # Page 3: Torrents & Auto-Install
+        self.torrents_page = QWidget()
+        self.init_torrents_ui()
+        self.page_stack.addWidget(self.torrents_page)
+
+        # Page 4: Console Companion & Services
+        self.console_page = QWidget()
+        self.init_console_ui()
+        self.page_stack.addWidget(self.console_page)
+
+        # Page 5: Settings
         self.settings_page = QWidget()
         self.init_settings_ui()
         self.page_stack.addWidget(self.settings_page)
@@ -2842,6 +3989,13 @@ class MainWindow(QMainWindow):
         self.chk_large_font.clicked.connect(self.on_large_font_toggled)
 
         self.top_layout.addWidget(self.chk_overwrite); self.top_layout.addWidget(self.chk_hide_pinned); self.top_layout.addWidget(self.chk_large_font)
+        
+        self.transport_combo = QComboBox()
+        self.transport_combo.addItems([self.t("transport_rpi"), self.t("transport_payload"), self.t("transport_service")])
+        self.transport_combo.setItemDelegate(CenterDelegate(self.transport_combo))
+        self.transport_combo.setToolTip(self.t("transport_mode"))
+        self.transport_combo.currentIndexChanged.connect(lambda idx: setattr(self, 'selected_transport', idx))
+        self.top_layout.addWidget(self.transport_combo)
         self.top_layout.addStretch(1)
         
         self.btn_backup = QPushButton("💾")
@@ -3039,10 +4193,20 @@ class MainWindow(QMainWindow):
         self.chk_auto_update.setChecked(self.settings.value("auto_update", True, type=bool))
         self.chk_auto_update.clicked.connect(self.save_auto_update_setting)
 
-        self.lang_combo = QComboBox(); self.lang_combo.addItems(["🇷🇺 Русский", "🇺🇸 English"])
+        LANG_DISPLAY = [
+            ("ru", "🇷🇺 Русский"),
+            ("en", "🇬🇧 English"),
+            ("de", "🇩🇪 Deutsch"),
+            ("fr", "🇫🇷 Français"),
+            ("zh", "🇨🇳 简体中文"),
+            ("ja", "🇯🇵 日本語")
+        ]
+        self.LANG_KEYS = [k for k, _ in LANG_DISPLAY]
+        self.lang_combo = QComboBox()
+        self.lang_combo.addItems([d for _, d in LANG_DISPLAY])
         self.lang_combo.setItemDelegate(CenterDelegate(self.lang_combo))
-        idx = 0 if self.current_lang == "ru" else 1
-        self.lang_combo.setCurrentIndex(idx); self.lang_combo.setFixedWidth(110)
+        idx = self.LANG_KEYS.index(self.current_lang) if self.current_lang in self.LANG_KEYS else 0
+        self.lang_combo.setCurrentIndex(idx); self.lang_combo.setFixedWidth(135)
         self.lang_combo.currentIndexChanged.connect(self.switch_language)
 
         # ДОБАВЛЕНИЕ В LAYOUT
@@ -3142,9 +4306,8 @@ class MainWindow(QMainWindow):
         
         self.ftp_remote_path = QComboBox()
         self.ftp_remote_path.setEditable(True)
-        self.ftp_remote_path.addItems(["/user/app/", "/user/appmeta/", "/mnt/sandbox/pfsmnt/", "/data/", "/mnt/usb0/"])
+        self.ftp_remote_path.addItems(["/user/app/", "/user/patch/", "/user/addcont/", "/user/home/", "/data/", "/mnt/usb0/", "/mnt/usb1/", "/mnt/ext0/", "/mnt/sandbox/pfsmnt/"])
         self.ftp_remote_path.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        # Connect signal later
         top_bar.addWidget(self.ftp_remote_path, 1)
         
         self.btn_ftp_connect = QPushButton(self.t("ftp_connect"))
@@ -3152,6 +4315,28 @@ class MainWindow(QMainWindow):
         top_bar.addWidget(self.btn_ftp_connect)
         
         layout.addLayout(top_bar)
+
+        # --- PS4 Quick-Jump Bookmarks Bar ---
+        quick_bar = QHBoxLayout()
+        quick_bar.addWidget(QLabel(f"<b>{self.t('ftp_quick_jump')}</b>"))
+        
+        ps4_bookmarks = [
+            ("🎮 Игры", "/user/app/"),
+            ("⚡ Патчи", "/user/patch/"),
+            ("🧩 DLC", "/user/addcont/"),
+            ("💾 Сейвы", "/user/home/"),
+            ("📁 Данные", "/data/"),
+            ("🔌 USB0", "/mnt/usb0/"),
+            ("💽 Внешний диск", "/mnt/ext0/"),
+            ("📦 PFS", "/mnt/sandbox/pfsmnt/")
+        ]
+        for b_name, b_path in ps4_bookmarks:
+            b_btn = QPushButton(b_name)
+            b_btn.setFixedHeight(26)
+            b_btn.clicked.connect(lambda ch, p=b_path: self.ftp_quick_navigate(p))
+            quick_bar.addWidget(b_btn)
+        quick_bar.addStretch(1)
+        layout.addLayout(quick_bar)
         
         # --- Search Bar ---
         search_bar = QHBoxLayout()
@@ -3565,167 +4750,31 @@ class MainWindow(QMainWindow):
     def trigger_ftp_search(self):
         """Trigger search (filter or recursive)."""
         text = self.ftp_remote_search.text().strip()
-        # TODO: Implement recursive search
-        self.ftp_filter_remote(text)
+        if not text:
+            self.ftp_filter_remote("")
+            return
 
-    # --- FTP CONTEXT MENUS (MISSING IMPLEMENTATION) ---
-    def ftp_local_context_menu(self, pos):
-        item = self.ftp_local_tree.itemAt(pos)
-        menu = QMenu()
-        
-        # Actions
-        act_open = menu.addAction(self.t("ctx_folder")) # "Open in Folder" -> or just Open
-        menu.addSeparator()
-        act_rename = menu.addAction(self.t("ctx_rename"))
-        act_new_folder = menu.addAction(self.t("ctx_new_folder"))
-        act_delete = menu.addAction(self.t("ftp_delete"))
-        menu.addSeparator()
-        act_refresh = menu.addAction(self.t("ftp_refresh"))
-        
-        action = menu.exec(self.ftp_local_tree.viewport().mapToGlobal(pos))
-        
-        if action == act_open: self.ftp_local_open()
-        elif action == act_rename: self.ftp_local_rename()
-        elif action == act_new_folder: self.ftp_local_new_folder()
-        elif action == act_delete: self.ftp_local_delete()
-        elif action == act_refresh: self.ftp_load_local()
-
-    def ftp_local_open(self):
-        items = self.ftp_local_tree.selectedItems()
-        if not items: return
-        path = items[0].data(0, Qt.ItemDataRole.UserRole)
-        if path and os.path.exists(path):
-            if os.path.isdir(path):
-                self.ftp_load_local_by_path(path)
-            else:
-                os.startfile(path)
-
-    def ftp_local_rename(self):
-        items = self.ftp_local_tree.selectedItems()
-        if not items: return
-        item = items[0]
-        old_path = item.data(0, Qt.ItemDataRole.UserRole)
-        if not old_path or item.text(0) == ".." or not os.path.exists(old_path): return
-        
-        old_name = item.text(0)
-        new_name, ok = QInputDialog.getText(self, self.t("ctx_rename"), self.t("rename_wide"), text=old_name)
-        if ok and new_name and new_name != old_name:
-            new_path = os.path.join(os.path.dirname(old_path), new_name)
-            try:
-                os.rename(old_path, new_path)
-                self.ftp_load_local()
-            except Exception as e:
-                QMessageBox.critical(self, "Error", f"Rename failed: {e}")
-
-    def ftp_local_new_folder(self):
-        path = self.ftp_local_path.currentText()
-        if not os.path.isdir(path): return
-        
-        name, ok = QInputDialog.getText(self, self.t("ctx_new_folder"), self.t("ftp_mkdir") + ":")
-        if ok and name:
-            new_dir = os.path.join(path, name)
-            try:
-                os.makedirs(new_dir, exist_ok=True)
-                self.ftp_load_local()
-            except Exception as e:
-                QMessageBox.critical(self, "Error", f"Create folder failed: {e}")
-
-    def ftp_local_delete(self):
-        items = self.ftp_local_tree.selectedItems()
-        if not items: return
-        path = items[0].data(0, Qt.ItemDataRole.UserRole)
-        if not path or items[0].text(0) == "..": return
-        
-        if QMessageBox.question(self, "Confirm", f"{self.t('ftp_delete')} '{os.path.basename(path)}'?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes:
-            try:
-                if os.path.isdir(path): shutil.rmtree(path)
-                else: os.remove(path)
-                self.ftp_load_local()
-            except Exception as e:
-                QMessageBox.critical(self, "Error", f"Delete failed: {e}")
-
-    def ftp_remote_context_menu(self, pos):
-        item = self.ftp_remote_tree.itemAt(pos)
-        menu = QMenu()
-        
-        if item:
-            name = item.text(0)
-            if name.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.dds')):
-                 act_view = menu.addAction(self.t("ctx_view_img")) # "View Image"
-                 action = menu.exec(self.ftp_remote_tree.viewport().mapToGlobal(pos))
-                 if action == act_view: self.ftp_view_image_remote()
-                 return
-
-        # Default actions can be added here (e.g. Delete, Download)
-        # For now, just View Image as requested
-        # menu.exec(self.ftp_remote_tree.viewport().mapToGlobal(pos))
-
-    def ftp_view_image_remote(self):
-        items = self.ftp_remote_tree.selectedItems()
-        if not items: return
-        name = items[0].text(0)
-        
-        # Need full path?
-        current_dir = self.ftp_remote_path.currentText()
-        if not current_dir.endswith("/"): current_dir += "/"
-        full_path = current_dir + name
-        
-        if not self.ftp_session: return
-        
-        self.lbl_sys.setText("Downloading image...")
-        
-        def dl_task():
-            try:
-                buf = io.BytesIO()
-                self.ftp_session.retrbinary(f"RETR {full_path}", buf.write)
-                data = buf.getvalue()
-                
-                # Show Dialog in Main Thread
-                class ShowDlg(QObject):
-                    sig = pyqtSignal()
-                    def run(self): self.sig.emit()
-                
-                s = ShowDlg()
-                s.sig.connect(lambda: ImagePreviewDialog(self, data, name).exec())
-                s.run() # This runs in BG thread, emitting signal to GUI? No, unsafe. 
-                
-                # Correct way: pass data to signal or QTimer
-                QTimer.singleShot(0, lambda: ImagePreviewDialog(self, data, name).exec())
-                
-            except Exception as e:
-                log(f"Image DL Error: {e}", "ERROR")
-            finally:
-                QTimer.singleShot(0, lambda: self.lbl_sys.setText(self.t("ready")))
-
-        threading.Thread(target=dl_task, daemon=True).start()
-        if not text: return
-        
         if self.chk_ftp_recursive.isChecked():
-            # Start Recursive Search
             ip = self.ip_input.currentText().strip()
             if not ip: return
-            
-            # Check if already searching
             if hasattr(self, 'ftp_search_thread') and self.ftp_search_thread.isRunning():
                 self.ftp_search_thread.stop()
-                
+
             self.ftp_remote_tree.clear()
-            self.btn_ftp_connect.setEnabled(False) # Prevent disconnect during search
+            self.btn_ftp_connect.setEnabled(False)
             self.ftp_remote_search.setDisabled(True)
             self.ftp_progress_bar.setVisible(True)
-            self.ftp_progress_bar.setRange(0, 0) # Indeterminate
-            
-            # Use current path if possible, else root
+            self.ftp_progress_bar.setRange(0, 0)
+
             cur = self.ftp_remote_path.currentText()
             if not cur or not cur.startswith("/"): cur = "/"
-            
+
             self.ftp_search_thread = FTPSearchThread(ip, cur, text)
             self.ftp_search_thread.found_signal.connect(self.update_ftp_search_results)
             self.ftp_search_thread.finished_signal.connect(self.on_ftp_search_finished)
             self.ftp_search_thread.error_signal.connect(lambda e: log(f"FTP Search Error: {e}", "ERROR"))
             self.ftp_search_thread.start()
         else:
-            # Normal Filter
             self.ftp_filter_remote(text)
 
     def update_ftp_search_results(self, results):
@@ -3885,6 +4934,11 @@ class MainWindow(QMainWindow):
                              lambda: self.ftp_local_rename_action(item))
                 menu.addAction("🗑 " + self.t("ftp_delete"), self.hotkey_delete)
         
+        if item:
+            path = item.data(0, Qt.ItemDataRole.UserRole)
+            if path and str(path).lower().endswith(".pkg"):
+                menu.addAction("📦 " + self.t("ftp_send_to_queue"), self.ftp_send_selected_to_sender)
+
         menu.addSeparator()
         menu.addAction("📁 " + (self.t("ctx_new_folder") if "ctx_new_folder" in LOCALE[self.current_lang] else "New Folder"), 
                      self.ftp_local_mkdir_action)
@@ -4216,55 +5270,6 @@ class MainWindow(QMainWindow):
                     self.setup_item_widgets(item, data[2], key)
             it += 1
 
-    def toggle_mini_mode(self):
-        self.is_mini_mode = not self.is_mini_mode
-        if self.is_mini_mode:
-            self.saved_geometry = self.saveGeometry()
-            self.saved_col_widths = [self.tree.columnWidth(i) for i in range(10)]
-            
-            # Hide components
-            self.sidebar.setVisible(False)
-            self.top_panel_widget.setVisible(False)
-            self.tree.setVisible(False)
-            self.bottom_panel_widget.setVisible(False)
-            if hasattr(self, 'status_frame'): self.status_frame.setVisible(False)
-            
-            # Button to floating
-            self.btn_mini.setParent(self.central_widget)
-            self.btn_mini.move(5, 5)
-            self.btn_mini.show()
-            self.btn_mini.setText("🔼")
-            
-            # Force size
-            self.setFixedSize(1050, 80)
-            
-        else:
-            # Restore components
-            self.setMinimumSize(1000, 700)
-            self.setMaximumSize(16777215, 16777215)
-            if self.saved_geometry: self.restoreGeometry(self.saved_geometry)
-            
-            self.sidebar.setVisible(True)
-            self.top_panel_widget.setVisible(True)
-            self.tree.setVisible(True)
-            self.bottom_panel_widget.setVisible(True)
-            if hasattr(self, 'status_frame'): self.status_frame.setVisible(True)
-            
-            self.btn_mini.setParent(self.top_panel_widget)
-            self.btn_mini.setText("🔽")
-            
-            # Re-insert into layout
-            idx = self.top_layout.indexOf(self.btn_add_menu)
-            if idx != -1: 
-                self.top_layout.insertWidget(idx, self.btn_mini)
-            else:
-                self.top_layout.addWidget(self.btn_mini)
-            
-            # Restore columns
-            if hasattr(self, 'saved_col_widths'):
-                 for i, w in enumerate(self.saved_col_widths):
-                     if i < 10: self.tree.setColumnWidth(i, w)
-
     def retranslate_ui(self):
         self.setWindowTitle(self.t("window_title"))
         self.lbl_ip.setText(self.t("ps4_ip"))
@@ -4313,7 +5318,10 @@ class MainWindow(QMainWindow):
         self.settings.setValue("column_widths", ",".join(map(str, widths)))
 
     def switch_language(self, index):
-        self.current_lang = "ru" if index == 0 else "en"
+        if hasattr(self, 'LANG_KEYS') and 0 <= index < len(self.LANG_KEYS):
+            self.current_lang = self.LANG_KEYS[index]
+        else:
+            self.current_lang = "ru" if index == 0 else "en"
         self.settings.setValue("language", self.current_lang)
         self.retranslate_ui()
 
@@ -4453,20 +5461,13 @@ class MainWindow(QMainWindow):
         grid.setSpacing(5)
         
         self.fw_checkboxes = {}
-        # List from BackportDialog (must match)
-        full_fw_list = [
-            "5.05", "5.07", "6.50", "6.71", "6.72", "7.00", "7.02", "7.35", 
-            "7.50", "7.55", "8.00", "8.52", "9.00", "9.03", "9.60", "10.00", 
-            "10.71", "11.00", "11.02", "11.52", "12.00", "12.02", "12.50", 
-            "12.52", "13.00", "13.02"
-        ]
         
         # Load saved selection
         saved_ml = self.settings.value("backport_my_list", "5.05,6.72,9.00").split(",")
         
         cols = 8
         grid_widget.setMaximumWidth(700)
-        for i, fw in enumerate(full_fw_list):
+        for i, fw in enumerate(SUPPORTED_FIRMWARES):
             cb = QCheckBox(fw)
             cb.setChecked(fw in saved_ml)
             cb.setStyleSheet("QCheckBox::indicator:checked { background-color: #4CAF50; border: 1px solid #4CAF50; }")
@@ -4532,86 +5533,6 @@ class MainWindow(QMainWindow):
         selected = [fw for fw, cb in self.fw_checkboxes.items() if cb.isChecked()]
         self.settings.setValue("backport_my_list", ",".join(selected))
         
-    def run_backport_action(self):
-        """Run Backport on selected PKG."""
-        items = self.tree.selectedItems()
-        if not items: return
-        
-        # Use auto-detected path
-        bp_path = getattr(self, "backport_path", "")
-        if not bp_path:
-             bp_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tools", "orbis-pub-cmd.exe")
-             
-        if not os.path.exists(bp_path):
-             QMessageBox.critical(self, self.t("backport_error"), self.t("backport_config_err") + f"\n({bp_path})")
-             return
-
-        data = items[0].data(0, Qt.ItemDataRole.UserRole)
-        pkg_path = data[2] if isinstance(data, tuple) else data
-        
-        if not pkg_path or not pkg_path.lower().endswith(".pkg"): return
-        
-        # Show Dialog
-        dlg = BackportDialog(self, pkg_path)
-        
-        # Load last selection
-        last_fw = self.settings.value("last_backport_fw", self.t("bp_all_fw"))
-        idx = dlg.fw_combo.findText(last_fw)
-        if idx >= 0: dlg.fw_combo.setCurrentIndex(idx)
-        
-        dlg.center_on_parent()
-        if dlg.exec():
-            selected_fw = dlg.fw_combo.currentText()
-            out_dir = dlg.path_input.text()
-            
-            # Save for next time
-            self.settings.setValue("last_backport_fw", selected_fw)
-            
-            # 1. Determine target firmware(s)
-            target_fws = []
-            if selected_fw == self.t("bp_all_fw"):
-                target_fws = dlg.fw_list
-            elif selected_fw == self.t("bp_my_list"):
-                saved_ml = self.settings.value("backport_my_list", "").split(",")
-                target_fws = [fw for fw in saved_ml if fw.strip()]
-            else:
-                target_fws = [selected_fw]
-            
-            if not target_fws:
-                 QMessageBox.warning(self, "Error", "No firmware versions selected.")
-                 return
-
-            # Prepare tools once
-            try:
-                temp_tools = os.path.join(tempfile.gettempdir(), "storm_tools")
-                os.makedirs(temp_tools, exist_ok=True)
-                
-                def copy_tools_from_dir(src_dir):
-                    if not os.path.exists(src_dir): return
-                    for fname in os.listdir(src_dir):
-                        if fname.lower().endswith(".exe") or fname.lower().endswith(".dll"):
-                            src_p = os.path.join(src_dir, fname)
-                            dst_p = os.path.join(temp_tools, fname)
-                            try:
-                                shutil.copy2(src_p, dst_p)
-                                if fname.lower() in ["sc.exe", "di.exe", "orbis-pub-sfo.exe"]:
-                                     ext_dir = os.path.join(temp_tools, "ext")
-                                     os.makedirs(ext_dir, exist_ok=True)
-                                     shutil.copy2(src_p, os.path.join(ext_dir, fname))
-                            except: pass
-
-                copy_tools_from_dir(os.path.dirname(bp_path))
-            except: pass
-
-            tool_paths = {
-                "cmd": os.path.join(temp_tools, "orbis-pub-cmd.exe"), 
-                "sfo": os.path.join(temp_tools, "orbis-pub-sfo.exe")
-            }
-            
-            self.lbl_sys.setText("Backporting...")
-            threading.Thread(target=self._execute_backport_all, args=(pkg_path, out_dir, target_fws, tool_paths), daemon=True).start()
-
-
     def save_pkg_table_columns(self, index, old, new):
         widths = [self.pkg_table.columnWidth(i) for i in range(5)]
         self.settings.setValue("pkg_table_widths", ",".join(map(str, widths)))
@@ -5575,10 +6496,15 @@ class MainWindow(QMainWindow):
         threading.Thread(target=wrk, daemon=True).start()
 
     def handle_install_status(self, key, status, msg):
-        it = QTreeWidgetItemIterator(self.tree); target_item = None
-        while it.value():
-            if it.value().data(0, Qt.ItemDataRole.UserRole + 1) == key: target_item = it.value(); break
-            it += 1
+        target_item = getattr(self, 'item_by_key', {}).get(str(key))
+        if not target_item:
+            it = QTreeWidgetItemIterator(self.tree)
+            while it.value():
+                if it.value().data(0, Qt.ItemDataRole.UserRole + 1) == key:
+                    target_item = it.value()
+                    if hasattr(self, 'item_by_key'): self.item_by_key[str(key)] = target_item
+                    break
+                it += 1
         if not target_item: return
         
         pb = self.tree.itemWidget(target_item, 7)
@@ -5612,6 +6538,8 @@ class MainWindow(QMainWindow):
             # Страховочный таймер: если через 15 секунд прогресс не начался,
             # считаем что PS4 скачала файл молча (особенно для малых файлов)
             QTimer.singleShot(15000, lambda k=key: self.check_stalled_download(k))
+            # 20-second Range Request Watchdog
+            QTimer.singleShot(20000, lambda k=key: self.check_unconfirmed_download(k))
 
         elif status == "ALREADY":
             if st: st.setText(self.t("already")); st.setStyleSheet(STATUS_STYLES["AlreadyInstalled"])
@@ -5730,48 +6658,54 @@ class MainWindow(QMainWindow):
         current_pct = self.progress_map.get(key, 0)
         if pct < current_pct:
             return  # Ignore lower progress values (can happen with concurrent range requests)
-        
+
         self.progress_map[key] = pct
-        it = QTreeWidgetItemIterator(self.tree)
-        while it.value():
-            item = it.value()
-            if item.data(0, Qt.ItemDataRole.UserRole + 1) == key:
-                pb = self.tree.itemWidget(item, 7); st = self.tree.itemWidget(item, 8); btn_widget = self.tree.itemWidget(item, 9)
-                
-                is_done = False
-                if st:
-                    txt = st.text().lower()
-                    # Исключаем "не установлено" / "not installed"
-                    is_installed_ru = "установлено" in txt and "не" not in txt
-                    is_installed_en = "installed" in txt and "not" not in txt
-                    if "already" in txt or "done" in txt or "завершено" in txt or "ранее" in txt or is_installed_ru or is_installed_en:
-                        is_done = True
-                        if btn_widget: btn_widget.setVisible(False)
-                        if pb: pb.setVisible(True); pb.setValue(100)
-                        self.progress_map[key] = 100
-                
-                if not is_done:
-                    if pb: 
-                        pb.setValue(pct)
-                        if not pb.isVisible() and self.is_item_visible_in_tree(item): pb.setVisible(True)
-                    if btn_widget and self.is_item_visible_in_tree(item): btn_widget.setVisible(True)
-                    
-                    if st and self.t("done") not in st.text(): 
-                        st.setText(self.t("sending").format(pct)); st.setStyleSheet(STATUS_STYLES["Installing"])
-                    
-                    if pct >= 100:
-                        if st: st.setText(self.t("done")); st.setStyleSheet(STATUS_STYLES["Installed"])
-                        if btn_widget: btn_widget.setVisible(False)
-                        # FIX: Remove from speed tracking to stop updates, but keep displayed speed as final average
-                        if key in self.speed_map: del self.speed_map[key]
-                        if key not in self.finished_unique_keys: 
-                            self.finished_unique_keys.add(key)
-                            self.finish_item_processing(item)
-                else:
-                    self.recalc_global_stats()
-                    return
-                break
-            it += 1
+        item = getattr(self, 'item_by_key', {}).get(str(key))
+        if not item:
+            it = QTreeWidgetItemIterator(self.tree)
+            while it.value():
+                if it.value().data(0, Qt.ItemDataRole.UserRole + 1) == key:
+                    item = it.value()
+                    if hasattr(self, 'item_by_key'):
+                        self.item_by_key[str(key)] = item
+                    break
+                it += 1
+
+        if item:
+            pb = self.tree.itemWidget(item, 7); st = self.tree.itemWidget(item, 8); btn_widget = self.tree.itemWidget(item, 9)
+
+            is_done = False
+            if st:
+                txt = st.text().lower()
+                is_installed_ru = "установ" in txt and "не" not in txt
+                is_installed_en = "installed" in txt and "not" not in txt
+                if "already" in txt or "done" in txt or is_installed_ru or is_installed_en:
+                    is_done = True
+                    if btn_widget: btn_widget.setVisible(False)
+                    if pb: pb.setVisible(True); pb.setValue(100)
+                    self.progress_map[key] = 100
+
+            if not is_done:
+                if pb:
+                    pb.setValue(pct)
+                    if not pb.isVisible() and self.is_item_visible_in_tree(item): pb.setVisible(True)
+                if btn_widget and self.is_item_visible_in_tree(item): btn_widget.setVisible(True)
+
+                if st and self.t("done") not in st.text():
+                    st.setText(self.t("sending").format(pct)); st.setStyleSheet(STATUS_STYLES["Installing"])
+
+                if pct >= 100:
+                    if st: st.setText(self.t("done")); st.setStyleSheet(STATUS_STYLES["Installed"])
+                    if btn_widget: btn_widget.setVisible(False)
+                    # FIX: Remove from speed tracking to stop updates, but keep displayed speed as final average
+                    if key in self.speed_map: del self.speed_map[key]
+                    if key not in self.finished_unique_keys:
+                        self.finished_unique_keys.add(key)
+                        self.finish_item_processing(item)
+            else:
+                self.recalc_global_stats()
+                return
+
         self.recalc_global_stats()
 
     def toggle_global_pause(self, checked):
@@ -6061,6 +6995,8 @@ class MainWindow(QMainWindow):
         self.tree.setItemWidget(item, 7, pb)
         self.tree.setItemWidget(item, 8, st)
         self.tree.setItemWidget(item, 9, btn_widget)
+        if hasattr(self, 'item_by_key') and file_key:
+            self.item_by_key[str(file_key)] = item
 
     def on_large_font_toggled(self): self.update_style()
     def update_style(self):
@@ -6145,9 +7081,10 @@ class MainWindow(QMainWindow):
             if "📌" in item.text(0): item.setHidden(should_hide)
             
     def load_pinned_data(self):
-        if not os.path.exists("pinned.json"): return
+        pinned_path = get_pinned_file_path()
+        if not os.path.exists(pinned_path): return
         try:
-            with open("pinned.json", "r", encoding="utf-8") as f:
+            with open(pinned_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 self.pinned_folders = data.get("folders", [])
                 self.pinned_data_cache = data.get("file_states", {})
@@ -6165,7 +7102,7 @@ class MainWindow(QMainWindow):
             it += 1
         save_data = {"folders": self.pinned_folders, "file_states": file_states}
         try:
-            with open("pinned.json", "w", encoding="utf-8") as f: json.dump(save_data, f, indent=4)
+            with open(get_pinned_file_path(), "w", encoding="utf-8") as f: json.dump(save_data, f, indent=4)
         except: pass
 
     def perform_shutdown_tasks(self):
@@ -7030,13 +7967,17 @@ class MainWindow(QMainWindow):
                      self.settings.setValue("show_ftp_warning", False)
 
     def update_sidebar_active(self, active_idx):
-        """Update sidebar button styles to highlight active page."""
+        """Update sidebar button styles to highlight active page with STORM SOFT 3D styling."""
+        theme_name = self.theme_combo.currentText() if hasattr(self, 'theme_combo') else "STORM DARK"
+        t = THEMES.get(theme_name, THEMES.get("STORM DARK", {}))
+        accent = t.get("input_border", "#00d2ff")
+        btn_bg = t.get("btn_bg", "#1e293b")
         for btn in self.sidebar_buttons:
             p = btn.property("page_idx")
             if p == active_idx:
-                btn.setStyleSheet("background-color: #4CAF50; border-radius: 8px; font-size: 20px;")
+                btn.setStyleSheet(f"background-color: {btn_bg}; border: 2px solid {accent}; border-radius: 8px; font-size: 20px; font-weight: bold;")
             else:
-                btn.setStyleSheet("background-color: #333; border-radius: 8px; font-size: 20px;")
+                btn.setStyleSheet("background-color: #222630; border: 1px solid #333a48; border-radius: 8px; font-size: 20px;")
 
     def run_backport_action(self):
         """Run the backport tool for the selected PKG."""
@@ -7227,33 +8168,9 @@ class MainWindow(QMainWindow):
         pkg_path = os.path.normpath(pkg_path)
         base_out_dir = os.path.normpath(out_dir)
         
-        # Root temp logic (preserved from original)
-        drive_root = os.path.splitdrive(base_out_dir)[0]
-        if not drive_root: 
-            if getattr(sys, 'frozen', False):
-                app_path = sys.executable
-            else:
-                app_path = os.path.abspath(__file__)
-            drive_root = os.path.splitdrive(app_path)[0]
-        if not drive_root: drive_root = "C:" 
-        if not drive_root.endswith(os.sep): drive_root += os.sep
-        
-        if not drive_root.endswith(os.sep): drive_root += os.sep
-        
-        # Common temp root
-        work_root_base = os.path.join(drive_root, "STORM_BP_TEMP")
-        
-        # Fallback Logic
-        try:
-             os.makedirs(work_root_base, exist_ok=True)
-             # Test write
-             test_file = os.path.join(work_root_base, ".test")
-             with open(test_file, "w") as f: f.write("test")
-             os.remove(test_file)
-        except:
-             log("Root Temp unavailable for Manual BP, using %TEMP%", "WARN")
-             work_root_base = os.path.join(tempfile.gettempdir(), "STORM_BP_TEMP")
-             os.makedirs(work_root_base, exist_ok=True)
+        # Standard temporary directory for backports (avoids admin rights issue on drive root)
+        work_root_base = os.path.join(tempfile.gettempdir(), "STORM_BP_TEMP")
+        os.makedirs(work_root_base, exist_ok=True)
              
         if os.path.exists(work_root_base):
             try: 
@@ -7356,10 +8273,7 @@ class MainWindow(QMainWindow):
             
                 # Patch Version
                 try:
-                    parts = fw_ver.split('.')
-                    maj = int(parts[0])
-                    min_ = int(parts[1]) if len(parts)>1 else 0
-                    ver_int = (maj << 24) | (min_ << 16)
+                    ver_int = fw_version_to_int(fw_ver)
                     
                     editor = SFOEditor(file_path=sfo_path)
                     editor.set_int("PUBTOOL_VER", ver_int)
@@ -7398,14 +8312,15 @@ class MainWindow(QMainWindow):
             if pkg_category.lower().strip().startswith("ac"): vol_type = "pkg_ps4_ac_data"
             elif pkg_category.lower().strip().startswith("gp"): vol_type = "pkg_ps4_patch"
             
+            safe_cid = xml.sax.saxutils.escape(content_id)
             lines = [
                 '<?xml version="1.0" encoding="utf-8" standalone="yes"?>',
                 '<psproject fmt="gp4" version="1000">',
                 '  <volume>',
                 f'    <volume_type>{vol_type}</volume_type>',
-                f'    <volume_id>{content_id}</volume_id>',
+                f'    <volume_id>{safe_cid}</volume_id>',
                 f'    <volume_ts>{ts}</volume_ts>',
-                f'    <package content_id="{content_id}" passcode="00000000000000000000000000000000"/>',
+                f'    <package content_id="{safe_cid}" passcode="00000000000000000000000000000000"/>',
                 '  </volume>',
                 '  <files img_no="0">'
             ]
@@ -7424,7 +8339,9 @@ class MainWindow(QMainWindow):
                     if f.endswith(".pkg"): continue
                     
                     rel_path = os.path.relpath(full_path, work_dir).replace("\\", "/")
-                    lines.append(f'    <file targ_path="{rel_path}" orig_path="{full_path}"/>')
+                    safe_rel = xml.sax.saxutils.escape(rel_path)
+                    safe_full = xml.sax.saxutils.escape(full_path)
+                    lines.append(f'    <file targ_path="{safe_rel}" orig_path="{safe_full}"/>')
 
             lines.append('  </files>')
             lines.append('  <rootdir></rootdir>')
@@ -7554,6 +8471,572 @@ class MainWindow(QMainWindow):
                 log(f"VC++ Install Error: {e}", "ERROR")
                 QMessageBox.critical(self, "Error", f"Failed to install VC++:\n{e}")
 
+
+    def check_unconfirmed_download(self, key):
+        """Verify that PS4 has sent at least one Range request within 20s."""
+        last_req = LAST_RANGE_REQUEST_TIME.get(str(key), 0)
+        pct = self.progress_map.get(key, 0)
+        if last_req == 0 and pct == 0:
+            target_item = getattr(self, 'item_by_key', {}).get(str(key))
+            if target_item:
+                st = self.tree.itemWidget(target_item, 8)
+                if st and self.t("done") not in st.text():
+                    st.setText(self.t("unconfirmed_download"))
+                    st.setToolTip(self.t("unconfirmed_download_tooltip"))
+                    st.setStyleSheet(STATUS_STYLES["Skipped"])
+                    log(f"Download for {key} unconfirmed: PS4 did not request data within 20s.", "WARN")
+
+    def ftp_quick_navigate(self, path):
+        """Quickly navigate remote FTP browser to specified PS4 system path."""
+        self.ftp_remote_path.setEditText(path)
+        self.ftp_list_dir(path)
+
+    def ftp_send_selected_to_sender(self):
+        """Send selected local PKG files directly to PKG Sender queue."""
+        sel_items = self.ftp_local_tree.selectedItems()
+        local_dir = self.ftp_local_path.currentText()
+        pkg_paths = []
+        for it in sel_items:
+            name = it.text(0)
+            if name.lower().endswith(".pkg"):
+                full_p = os.path.normpath(os.path.join(local_dir, name))
+                if os.path.isfile(full_p):
+                    pkg_paths.append(full_p)
+        if pkg_paths:
+            self.add_files_to_tree(pkg_paths)
+            self.switch_page(0)
+            self.show_status_msg(f"Добавлено {len(pkg_paths)} PKG из файлового менеджера.")
+
+
+    # =========================================================================
+    # --- TORRENTS & AUTO-INSTALL PAGE (PAGE 3) ---
+    # =========================================================================
+    def init_torrents_ui(self):
+        """Initialize qBittorrent & Torznab integration UI with auto-install pipeline."""
+        layout = QVBoxLayout(self.torrents_page)
+        layout.setContentsMargins(15, 15, 15, 15)
+        layout.setSpacing(12)
+
+        # 1. qBittorrent Connection Card
+        grp_conn = QGroupBox(self.t("qbit_settings"))
+        conn_layout = QGridLayout(grp_conn)
+        conn_layout.setSpacing(8)
+
+        conn_layout.addWidget(QLabel(self.t("qbit_url")), 0, 0)
+        self.qbit_url_input = QLineEdit("http://127.0.0.1:8080")
+        conn_layout.addWidget(self.qbit_url_input, 0, 1)
+
+        conn_layout.addWidget(QLabel(self.t("qbit_user")), 0, 2)
+        self.qbit_user_input = QLineEdit("admin")
+        self.qbit_user_input.setFixedWidth(120)
+        conn_layout.addWidget(self.qbit_user_input, 0, 3)
+
+        conn_layout.addWidget(QLabel(self.t("qbit_pass")), 0, 4)
+        self.qbit_pass_input = QLineEdit()
+        self.qbit_pass_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.qbit_pass_input.setFixedWidth(120)
+        conn_layout.addWidget(self.qbit_pass_input, 0, 5)
+
+        self.btn_qbit_connect = QPushButton(self.t("qbit_connect"))
+        self.btn_qbit_connect.setFixedWidth(120)
+        self.btn_qbit_connect.clicked.connect(self.on_qbit_connect_clicked)
+        conn_layout.addWidget(self.btn_qbit_connect, 0, 6)
+
+        # Path mapping row
+        conn_layout.addWidget(QLabel(self.t("qbit_local_dir")), 1, 0)
+        self.qbit_local_dir_input = QLineEdit()
+        self.qbit_local_dir_input.setPlaceholderText("D:\\Downloads\\PS4")
+        conn_layout.addWidget(self.qbit_local_dir_input, 1, 1, 1, 2)
+
+        btn_browse_local = QPushButton("📁")
+        btn_browse_local.setFixedWidth(40)
+        btn_browse_local.clicked.connect(lambda: self.browse_folder_into(self.qbit_local_dir_input))
+        conn_layout.addWidget(btn_browse_local, 1, 3)
+
+        conn_layout.addWidget(QLabel(self.t("qbit_nas_dir")), 1, 4)
+        self.qbit_nas_dir_input = QLineEdit()
+        self.qbit_nas_dir_input.setPlaceholderText("/volume1/downloads (NAS)")
+        conn_layout.addWidget(self.qbit_nas_dir_input, 1, 5, 1, 2)
+
+        # Status badge
+        self.lbl_qbit_status = QLabel("⚪ qBittorrent: Не подключен")
+        self.lbl_qbit_status.setStyleSheet("color: #888; font-weight: bold;")
+        conn_layout.addWidget(self.lbl_qbit_status, 2, 0, 1, 7)
+
+        layout.addWidget(grp_conn)
+
+        # 2. Add Torrent Card
+        grp_add = QGroupBox(self.t("qbit_add_torrent"))
+        add_layout = QHBoxLayout(grp_add)
+        add_layout.setSpacing(10)
+
+        self.torrent_source_input = QLineEdit()
+        self.torrent_source_input.setPlaceholderText("magnet:?xt=urn:btih:... или http(s)://.../game.torrent")
+        add_layout.addWidget(self.torrent_source_input, 1)
+
+        self.chk_torrent_auto_install = QCheckBox(self.t("qbit_auto_install"))
+        self.chk_torrent_auto_install.setChecked(True)
+        add_layout.addWidget(self.chk_torrent_auto_install)
+
+        self.btn_add_torrent = QPushButton(self.t("qbit_btn_download"))
+        self.btn_add_torrent.setFixedWidth(130)
+        self.btn_add_torrent.clicked.connect(self.on_add_torrent_clicked)
+        add_layout.addWidget(self.btn_add_torrent)
+
+        layout.addWidget(grp_add)
+
+        # 3. Active Torrents Table
+        self.torrents_table = QTableWidget()
+        self.torrents_table.setColumnCount(7)
+        self.torrents_table.setHorizontalHeaderLabels([
+            self.t("qbit_col_name"),
+            self.t("qbit_col_size"),
+            self.t("qbit_col_prog"),
+            self.t("qbit_col_speed"),
+            "Seeds",
+            self.t("qbit_col_status"),
+            self.t("qbit_col_actions")
+        ])
+        self.torrents_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.torrents_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.torrents_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        self.torrents_table.setColumnWidth(2, 160)
+        self.torrents_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.torrents_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        self.torrents_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        self.torrents_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
+        self.torrents_table.verticalHeader().setVisible(False)
+        layout.addWidget(self.torrents_table, 1)
+
+        # 4. Torznab Search Card (Jackett / Prowlarr)
+        grp_search = QGroupBox(self.t("torznab_search"))
+        search_layout = QGridLayout(grp_search)
+        search_layout.setSpacing(8)
+
+        search_layout.addWidget(QLabel(self.t("torznab_url")), 0, 0)
+        self.torznab_url_input = QLineEdit("http://127.0.0.1:9117/api/v2.0/indexers/all/results/torznab/")
+        search_layout.addWidget(self.torznab_url_input, 0, 1)
+
+        search_layout.addWidget(QLabel(self.t("torznab_key")), 0, 2)
+        self.torznab_key_input = QLineEdit()
+        self.torznab_key_input.setFixedWidth(140)
+        search_layout.addWidget(self.torznab_key_input, 0, 3)
+
+        self.torznab_query_input = QLineEdit()
+        self.torznab_query_input.setPlaceholderText(self.t("torznab_query"))
+        self.torznab_query_input.returnPressed.connect(self.on_torznab_search_clicked)
+        search_layout.addWidget(self.torznab_query_input, 1, 0, 1, 3)
+
+        self.btn_torznab_search = QPushButton(self.t("torznab_find"))
+        self.btn_torznab_search.setFixedWidth(140)
+        self.btn_torznab_search.clicked.connect(self.on_torznab_search_clicked)
+        search_layout.addWidget(self.btn_torznab_search, 1, 3)
+
+        self.torznab_table = QTableWidget()
+        self.torznab_table.setColumnCount(4)
+        self.torznab_table.setHorizontalHeaderLabels([self.t("qbit_col_name"), self.t("qbit_col_size"), "Seeds", self.t("qbit_col_actions")])
+        self.torznab_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.torznab_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.torznab_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.torznab_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.torznab_table.setMaximumHeight(160)
+        self.torznab_table.verticalHeader().setVisible(False)
+        search_layout.addWidget(self.torznab_table, 2, 0, 1, 4)
+
+        layout.addWidget(grp_search)
+
+        # Restore saved settings
+        saved_qbit_url = self.settings.value("qbit_url", "http://127.0.0.1:8080")
+        saved_qbit_user = self.settings.value("qbit_user", "admin")
+        saved_local_dir = self.settings.value("qbit_local_dir", "")
+        saved_nas_dir = self.settings.value("qbit_nas_dir", "")
+        saved_torznab_url = self.settings.value("torznab_url", "")
+        saved_torznab_key = self.settings.value("torznab_key", "")
+
+        self.qbit_url_input.setText(saved_qbit_url)
+        self.qbit_user_input.setText(saved_qbit_user)
+        self.qbit_local_dir_input.setText(saved_local_dir)
+        self.qbit_nas_dir_input.setText(saved_nas_dir)
+        if saved_torznab_url: self.torznab_url_input.setText(saved_torznab_url)
+        if saved_torznab_key: self.torznab_key_input.setText(saved_torznab_key)
+
+        # Auto-connect if configured
+        QTimer.singleShot(2000, self.on_qbit_connect_clicked)
+
+    def browse_folder_into(self, line_edit):
+        """Open folder dialog and put path into line edit."""
+        d = QFileDialog.getExistingDirectory(self, "Выберите папку загрузок")
+        if d:
+            line_edit.setText(d)
+
+    def on_qbit_connect_clicked(self):
+        """Connect to qBittorrent Web UI and start watcher."""
+        url = self.qbit_url_input.text().strip()
+        user = self.qbit_user_input.text().strip()
+        pwd = self.qbit_pass_input.text().strip()
+        local_dir = self.qbit_local_dir_input.text().strip()
+        nas_dir = self.qbit_nas_dir_input.text().strip()
+
+        self.settings.setValue("qbit_url", url)
+        self.settings.setValue("qbit_user", user)
+        self.settings.setValue("qbit_local_dir", local_dir)
+        self.settings.setValue("qbit_nas_dir", nas_dir)
+
+        self.qbit_client = QBittorrentClient(
+            base_url=url,
+            username=user,
+            password=pwd,
+            local_download_dir=local_dir,
+            remote_nas_dir=nas_dir
+        )
+
+        ok, msg = self.qbit_client.login()
+        if ok:
+            self.lbl_qbit_status.setText(f"🟢 {msg}")
+            self.lbl_qbit_status.setStyleSheet("color: #4CAF50; font-weight: bold;")
+            log(f"qBittorrent: {msg}", "INFO")
+
+            # Start or restart watcher thread
+            if hasattr(self, 'torrent_watcher') and self.torrent_watcher:
+                self.torrent_watcher.stop()
+            self.torrent_watcher = TorrentAutoInstallWatcher(lambda: self.qbit_client, self)
+            self.torrent_watcher.torrents_updated.connect(self.on_torrents_updated)
+            self.torrent_watcher.status_updated.connect(self.on_qbit_status_updated)
+            self.torrent_watcher.auto_install_triggered.connect(self.on_torrent_auto_install)
+            self.torrent_watcher.start()
+        else:
+            self.lbl_qbit_status.setText(f"🔴 qBittorrent: {msg}")
+            self.lbl_qbit_status.setStyleSheet("color: #F44336; font-weight: bold;")
+            log(f"qBittorrent Error: {msg}", "WARN")
+
+    def on_qbit_status_updated(self, msg, connected):
+        if hasattr(self, 'lbl_qbit_status'):
+            color = "#4CAF50" if connected else "#F44336"
+            icon = "🟢" if connected else "🔴"
+            self.lbl_qbit_status.setText(f"{icon} {msg}")
+            self.lbl_qbit_status.setStyleSheet(f"color: {color}; font-weight: bold;")
+
+    def on_add_torrent_clicked(self):
+        source = self.torrent_source_input.text().strip()
+        if not source:
+            QMessageBox.warning(self, "Внимание", "Введите magnet-ссылку или URL торрента.")
+            return
+
+        if not hasattr(self, 'qbit_client') or not self.qbit_client:
+            self.on_qbit_connect_clicked()
+
+        auto_install = self.chk_torrent_auto_install.isChecked()
+        ok, msg = self.qbit_client.add_torrent(source, auto_install=auto_install)
+        if ok:
+            QMessageBox.information(self, "Успех", "Торрент успешно добавлен в qBittorrent!")
+            self.torrent_source_input.clear()
+            log(f"Torrent added to qBittorrent (Auto-Install={auto_install})", "INFO")
+        else:
+            QMessageBox.critical(self, "Ошибка", f"Не удалось добавить торрент: {msg}")
+
+    def on_torrents_updated(self, torrents):
+        """Update active torrents table."""
+        self.torrents_table.setRowCount(len(torrents))
+        for row, t in enumerate(torrents):
+            name = t.get("name", "Unknown")
+            size = t.get("size", 0)
+            size_gb = f"{size / (1024**3):.2f} ГБ" if size > 0 else "0 МБ"
+            progress = t.get("progress", 0)
+            pct = int(progress * 100)
+            dlspeed = t.get("dlspeed", 0)
+            speed_str = f"{dlspeed / (1024**2):.1f} МБ/с" if dlspeed > 0 else "0 КБ/с"
+            seeds = f"{t.get('num_seeds', 0)} ({t.get('num_complete', 0)})"
+            state = t.get("state", "")
+            thash = t.get("hash", "")
+
+            self.torrents_table.setItem(row, 0, QTableWidgetItem(name))
+            self.torrents_table.setItem(row, 1, QTableWidgetItem(size_gb))
+
+            pb = QProgressBar()
+            pb.setRange(0, 100)
+            pb.setValue(pct)
+            pb.setTextVisible(True)
+            self.torrents_table.setCellWidget(row, 2, pb)
+
+            self.torrents_table.setItem(row, 3, QTableWidgetItem(speed_str))
+            self.torrents_table.setItem(row, 4, QTableWidgetItem(seeds))
+            self.torrents_table.setItem(row, 5, QTableWidgetItem(state))
+
+            # Action buttons
+            act_widget = QWidget()
+            act_layout = QHBoxLayout(act_widget)
+            act_layout.setContentsMargins(2, 2, 2, 2)
+            act_layout.setSpacing(4)
+
+            btn_pause = QPushButton("⏸")
+            btn_pause.setFixedSize(28, 24)
+            btn_pause.setToolTip("Пауза")
+            btn_pause.clicked.connect(lambda ch, h=thash: self.qbit_client and self.qbit_client.pause_torrent(h))
+
+            btn_resume = QPushButton("▶")
+            btn_resume.setFixedSize(28, 24)
+            btn_resume.setToolTip("Возобновить")
+            btn_resume.clicked.connect(lambda ch, h=thash: self.qbit_client and self.qbit_client.resume_torrent(h))
+
+            btn_del = QPushButton("❌")
+            btn_del.setFixedSize(28, 24)
+            btn_del.setToolTip("Удалить из qBittorrent")
+            btn_del.clicked.connect(lambda ch, h=thash: self.qbit_client and self.qbit_client.delete_torrent(h))
+
+            act_layout.addWidget(btn_pause)
+            act_layout.addWidget(btn_resume)
+            act_layout.addWidget(btn_del)
+            self.torrents_table.setCellWidget(row, 6, act_widget)
+
+    def on_torrent_auto_install(self, name, pkg_paths):
+        """Auto-install pipeline: import completed PKGs and queue them for PS4 installation."""
+        log(f"Auto-install triggered for torrent «{name}» ({len(pkg_paths)} PKG files)", "INFO")
+        self.show_status_msg(f"Торрент «{name}» завершён: {len(pkg_paths)} PKG отправляются на PS4...")
+
+        # Add files to tree
+        self.add_files_to_tree(pkg_paths)
+
+        # Automatically start install queue if PS4 is online
+        QTimer.singleShot(1500, self.send_all)
+
+    def on_torznab_search_clicked(self):
+        """Search torrents via Torznab (Jackett / Prowlarr)."""
+        url = self.torznab_url_input.text().strip()
+        key = self.torznab_key_input.text().strip()
+        query = self.torznab_query_input.text().strip()
+
+        if not query:
+            return
+
+        self.settings.setValue("torznab_url", url)
+        self.settings.setValue("torznab_key", key)
+
+        client = TorznabClient(url, key)
+        self.btn_torznab_search.setEnabled(False)
+        self.btn_torznab_search.setText("⏳ ...")
+
+        def search_thread():
+            results = client.search(query)
+            QTimer.singleShot(0, lambda: self.display_torznab_results(results))
+
+        threading.Thread(target=search_thread, daemon=True).start()
+
+    def display_torznab_results(self, results):
+        self.btn_torznab_search.setEnabled(True)
+        self.btn_torznab_search.setText(self.t("torznab_find"))
+
+        self.torznab_table.setRowCount(len(results))
+        for row, item in enumerate(results):
+            title = item.get("title", "")
+            size_gb = f"{item.get('size_gb', 0)} ГБ"
+            seeds = str(item.get("seeds", 0))
+            link = item.get("download_url", "")
+
+            self.torznab_table.setItem(row, 0, QTableWidgetItem(title))
+            self.torznab_table.setItem(row, 1, QTableWidgetItem(size_gb))
+            self.torznab_table.setItem(row, 2, QTableWidgetItem(seeds))
+
+            btn_dl = QPushButton("📥 " + self.t("qbit_btn_download"))
+            btn_dl.setFixedHeight(24)
+            btn_dl.clicked.connect(lambda ch, l=link: self.download_torznab_item(l))
+            self.torznab_table.setCellWidget(row, 3, btn_dl)
+
+    def download_torznab_item(self, url):
+        if not hasattr(self, 'qbit_client') or not self.qbit_client:
+            self.on_qbit_connect_clicked()
+        if self.qbit_client:
+            ok, msg = self.qbit_client.add_torrent(url, auto_install=self.chk_torrent_auto_install.isChecked())
+            if ok:
+                QMessageBox.information(self, "Успех", "Торрент отправлен в qBittorrent с автоустановкой!")
+            else:
+                QMessageBox.critical(self, "Ошибка", f"Не удалось добавить: {msg}")
+
+    # =========================================================================
+    # --- CONSOLE COMPANION & SERVICES PAGE (PAGE 4) ---
+    # =========================================================================
+    def init_console_ui(self):
+        """Initialize Console Companion UI (PackegeFlowService port 12801)."""
+        layout = QVBoxLayout(self.console_page)
+        layout.setContentsMargins(15, 15, 15, 15)
+        layout.setSpacing(12)
+
+        # Header bar
+        header = QHBoxLayout()
+        header.addWidget(QLabel("PS4 IP:"))
+        ip_txt = self.ip_input.currentText() if hasattr(self, 'ip_input') else ""
+        self.console_ip_lbl = QLabel(ip_txt)
+        self.console_ip_lbl.setStyleSheet("font-weight: bold; font-size: 14px;")
+        header.addWidget(self.console_ip_lbl)
+
+        self.btn_console_refresh = QPushButton(self.t("console_refresh"))
+        self.btn_console_refresh.setFixedWidth(180)
+        self.btn_console_refresh.clicked.connect(self.on_console_refresh_clicked)
+        header.addWidget(self.btn_console_refresh)
+
+        self.lbl_console_status = QLabel("⚪ PackegeFlowService: Не проверено")
+        self.lbl_console_status.setStyleSheet("color: #888; font-weight: bold;")
+        header.addWidget(self.lbl_console_status)
+        header.addStretch(1)
+        layout.addLayout(header)
+
+        # Cards Layout (System Info & Storage)
+        cards_layout = QHBoxLayout()
+
+        # System Info Card
+        grp_sys = QGroupBox(self.t("console_system_info"))
+        sys_layout = QFormLayout(grp_sys)
+        self.lbl_ps4_fw = QLabel("---")
+        self.lbl_ps4_model = QLabel("---")
+        self.lbl_ps4_hen = QLabel("---")
+        sys_layout.addRow(self.t("console_firmware"), self.lbl_ps4_fw)
+        sys_layout.addRow(self.t("console_model"), self.lbl_ps4_model)
+        sys_layout.addRow(self.t("console_hen"), self.lbl_ps4_hen)
+        cards_layout.addWidget(grp_sys, 1)
+
+        # Storage Card
+        grp_stor = QGroupBox(self.t("console_storage"))
+        stor_layout = QVBoxLayout(grp_stor)
+        self.lbl_hdd_info = QLabel("HDD: ---")
+        self.pb_hdd_storage = QProgressBar()
+        self.pb_hdd_storage.setRange(0, 100)
+        self.lbl_usb_info = QLabel("USB Ext: ---")
+        self.pb_usb_storage = QProgressBar()
+        self.pb_usb_storage.setRange(0, 100)
+        self.pb_usb_storage.setVisible(False)
+        self.lbl_usb_info.setVisible(False)
+        stor_layout.addWidget(self.lbl_hdd_info)
+        stor_layout.addWidget(self.pb_hdd_storage)
+        stor_layout.addWidget(self.lbl_usb_info)
+        stor_layout.addWidget(self.pb_usb_storage)
+        cards_layout.addWidget(grp_stor, 1)
+
+        layout.addLayout(cards_layout)
+
+        # Installed Apps & Components Tree
+        layout.addWidget(QLabel(f"<b>{self.t('console_installed_apps')}</b>"))
+        self.console_apps_tree = QTreeWidget()
+        self.console_apps_tree.setHeaderLabels(["Title ID", self.t("pkg_title"), self.t("pkg_ver"), self.t("pkg_size"), "Хранилище / Storage", "Ревизия"])
+        self.console_apps_tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        layout.addWidget(self.console_apps_tree, 1)
+
+        # Action bar
+        act_bar = QHBoxLayout()
+        self.btn_console_uninstall = QPushButton(self.t("console_uninstall_comp"))
+        self.btn_console_uninstall.setFixedHeight(32)
+        self.btn_console_uninstall.clicked.connect(self.on_console_uninstall_clicked)
+        act_bar.addWidget(self.btn_console_uninstall)
+        act_bar.addStretch(1)
+        layout.addLayout(act_bar)
+
+    def on_console_refresh_clicked(self):
+        """Fetch system info and installed apps from PackegeFlowService (port 12801)."""
+        ip = self.ip_input.currentText().strip()
+        self.console_ip_lbl.setText(ip)
+        self.console_client = PackegeFlowServiceClient(ip)
+
+        self.btn_console_refresh.setEnabled(False)
+        self.btn_console_refresh.setText("⏳ ...")
+        self.lbl_console_status.setText("⏳ Подключение к порту 12801...")
+
+        def fetch_task():
+            snapshot = self.console_client.get_system_snapshot()
+            apps = []
+            if snapshot.get("online"):
+                apps = self.console_client.get_installed_apps()
+            QTimer.singleShot(0, lambda: self.display_console_data(snapshot, apps))
+
+        threading.Thread(target=fetch_task, daemon=True).start()
+
+    def display_console_data(self, snapshot, apps):
+        self.btn_console_refresh.setEnabled(True)
+        self.btn_console_refresh.setText(self.t("console_refresh"))
+
+        if snapshot.get("online"):
+            ver = snapshot.get("version", "")
+            self.lbl_console_status.setText(f"🟢 PackegeFlowService v{ver} (Порт 12801)")
+            self.lbl_console_status.setStyleSheet("color: #4CAF50; font-weight: bold;")
+
+            self.lbl_ps4_fw.setText(f"<b>{snapshot.get('firmware', '---')}</b>")
+            self.lbl_ps4_model.setText(f"{snapshot.get('model', '---')} ({snapshot.get('family', '')})")
+            self.lbl_ps4_hen.setText(f"{snapshot.get('hen', 'GoldHEN')} {snapshot.get('hen_version', '')}")
+
+            # Storage
+            storage_list = snapshot.get("storage", [])
+            if storage_list:
+                hdd = storage_list[0]
+                used_gb = hdd.get("used_gb", 0)
+                tot_gb = hdd.get("total_gb", 0)
+                free_gb = hdd.get("free_gb", 0)
+                pct = int(hdd.get("pct_used", 0))
+                self.lbl_hdd_info.setText(f"HDD (/user): {used_gb} ГБ занято, {free_gb} ГБ свободно из {tot_gb} ГБ")
+                self.pb_hdd_storage.setValue(pct)
+
+                if len(storage_list) > 1:
+                    usb = storage_list[1]
+                    self.lbl_usb_info.setVisible(True)
+                    self.pb_usb_storage.setVisible(True)
+                    u_used = usb.get("used_gb", 0)
+                    u_free = usb.get("free_gb", 0)
+                    u_tot = usb.get("total_gb", 0)
+                    self.lbl_usb_info.setText(f"USB ({usb.get('path')}): {u_used} ГБ / {u_tot} ГБ")
+                    self.pb_usb_storage.setValue(int(usb.get("pct_used", 0)))
+        else:
+            self.lbl_console_status.setText("🔴 PackegeFlowService не отвечает на порту 12801")
+            self.lbl_console_status.setStyleSheet("color: #F44336; font-weight: bold;")
+
+        # Populate apps tree
+        self.console_apps_tree.clear()
+        for app in apps:
+            tid = app.get("titleId", "")
+            name = app.get("title", "")
+            ver = app.get("version", "")
+            item = QTreeWidgetItem([tid, name, ver, "---", "Internal", ""])
+            item.setData(0, Qt.ItemDataRole.UserRole, app)
+            self.console_apps_tree.addTopLevelItem(item)
+
+    def on_console_uninstall_clicked(self):
+        """Request component-level safe uninstallation without touching saves."""
+        items = self.console_apps_tree.selectedItems()
+        if not items:
+            QMessageBox.warning(self, "Внимание", "Выберите приложение для удаления.")
+            return
+
+        item = items[0]
+        tid = item.text(0)
+        name = item.text(1)
+
+        reply = QMessageBox.question(
+            self,
+            "Подтверждение удаления",
+            f"Вы уверены, что хотите удалить {name} ({tid}) с консоли PS4?\n\n"
+            "Примечание: Пользовательские сохранения игры затронуты не будут.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        if not hasattr(self, 'console_client') or not self.console_client:
+            self.console_client = PackegeFlowServiceClient(self.ip_input.currentText().strip())
+
+        def remove_task():
+            res = self.console_client.remove_component(
+                title_id=tid,
+                kind="game",
+                component_id="all",
+                revision=""
+            )
+            QTimer.singleShot(0, lambda: self.on_console_remove_finished(tid, res))
+
+        threading.Thread(target=remove_task, daemon=True).start()
+
+    def on_console_remove_finished(self, tid, res):
+        if "error" in res and res["error"]:
+            QMessageBox.critical(self, "Ошибка удаления", f"PS4 вернула ошибку: {res['error']}")
+        else:
+            QMessageBox.information(self, "Удаление", f"Задание на удаление {tid} успешно принято консолью PS4!")
+            self.on_console_refresh_clicked()
+
+
 def exception_hook(exctype, value, traceback_obj):
     import traceback
     # Print to console/stderr for dev
@@ -7577,6 +9060,8 @@ def exception_hook(exctype, value, traceback_obj):
 if __name__ == "__main__":
     import multiprocessing; multiprocessing.freeze_support()
     sys.excepthook = exception_hook
+    if not acquire_single_instance():
+        sys.exit(0)
     app = QApplication(sys.argv)
     ico_path = resource_path("stormps4pkgsender.ico")
     if os.path.exists(ico_path): app_icon = QIcon(ico_path); app.setWindowIcon(app_icon)
