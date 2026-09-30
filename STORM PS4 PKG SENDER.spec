@@ -5,7 +5,7 @@ a = Analysis(
     ['stormps4pkgsender.py'],
     pathex=[],
     binaries=[],
-    datas=[('tools', 'tools'), ('AppIcon.ico', '.'), ('logo.png', '.'), ('aliases.json', '.')],
+    datas=[('tools', 'tools'), ('AppIcon.ico', '.'), ('app.ico', '.'), ('logo.png', '.'), ('aliases.json', '.')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

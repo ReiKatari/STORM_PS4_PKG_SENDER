@@ -277,6 +277,86 @@ def resource_path(relative_path):
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
 
+def get_app_icon_path():
+    candidates = [
+        "AppIcon.ico",
+        "app.ico",
+        "stormps4pkgsender.ico",
+        "stormps4pkgsender.png",
+        "logo.png"
+    ]
+    for c in candidates:
+        try:
+            p = resource_path(c)
+            if os.path.exists(p): return p
+        except Exception: pass
+        try:
+            p_exe = os.path.join(os.path.dirname(sys.executable), c)
+            if os.path.exists(p_exe): return p_exe
+        except Exception: pass
+        try:
+            p_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), c)
+            if os.path.exists(p_file): return p_file
+        except Exception: pass
+        try:
+            p_cwd = os.path.join(os.getcwd(), c)
+            if os.path.exists(p_cwd): return p_cwd
+        except Exception: pass
+        try:
+            p_files = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Files", c)
+            if os.path.exists(p_files): return p_files
+        except Exception: pass
+    return ""
+
+def get_app_icon():
+    p = get_app_icon_path()
+    if p and os.path.exists(p):
+        return QIcon(p)
+    return QIcon()
+
+def detect_system_language():
+    try:
+        # 1. Direct native Windows UI language via ctypes
+        lang_id = ctypes.windll.kernel32.GetUserDefaultUILanguage() & 0x3FF
+        if lang_id in (0x19, 0x22, 0x23, 0x3F): # ru, uk, be, kk
+            return "ru"
+        elif lang_id == 0x07: # de
+            return "de"
+        elif lang_id == 0x0C: # fr
+            return "fr"
+        elif lang_id == 0x04: # zh
+            return "zh"
+        elif lang_id == 0x11: # ja
+            return "ja"
+    except Exception: pass
+    try:
+        # 2. Qt QLocale
+        sys_locale = QLocale.system().name().lower()
+        if sys_locale.startswith(("ru", "be", "uk", "kk")):
+            return "ru"
+        elif sys_locale.startswith("de"):
+            return "de"
+        elif sys_locale.startswith("fr"):
+            return "fr"
+        elif sys_locale.startswith("zh"):
+            return "zh"
+        elif sys_locale.startswith("ja"):
+            return "ja"
+    except Exception: pass
+    try:
+        # 3. Python locale fallback
+        import locale
+        loc = locale.getdefaultlocale()[0]
+        if loc:
+            loc = loc.lower()
+            if loc.startswith(("ru", "be", "uk", "kk", "russian")): return "ru"
+            elif loc.startswith(("de", "german")): return "de"
+            elif loc.startswith(("fr", "french")): return "fr"
+            elif loc.startswith(("zh", "chinese")): return "zh"
+            elif loc.startswith(("ja", "japanese")): return "ja"
+    except Exception: pass
+    return "en"
+
 def hide_console():
     try:
         hwnd = ctypes.windll.kernel32.GetConsoleWindow()
@@ -317,7 +397,7 @@ class ImagePreviewDialog(QDialog):
 # --- LOCALIZATION ---
 LOCALE = {
     "ru": {
-        "window_title": f"STORM PS4 PKG SENDER v{CURRENT_VERSION}",
+        "window_title": f"STORM PS4 PKG SENDER {CURRENT_VERSION}",
         "ps4_ip": "PS4 IP:",
         "check_conn": "🔗 Проверить",
         "scan_net": "🌐 Поиск",
@@ -550,7 +630,7 @@ LOCALE = {
         "ftp_nav_up": "⬆ Вверх"
     },
     "en": {
-        "window_title": f"STORM PS4 PKG SENDER v{CURRENT_VERSION}",
+        "window_title": f"STORM PS4 PKG SENDER {CURRENT_VERSION}",
         "confirm_uninstall": "Confirm Uninstall",
         "msg_confirm_uninstall": "Uninstall {} ({})?",
         "ps4_ip": "PS4 IP:",
@@ -783,7 +863,7 @@ LOCALE = {
         "ftp_nav_up": "⬆ Up"
     },
     "de": {
-        "window_title": f"STORM PS4 PKG SENDER v{CURRENT_VERSION}",
+        "window_title": f"STORM PS4 PKG SENDER {CURRENT_VERSION}",
         "confirm_uninstall": "Deinstallation bestätigen",
         "msg_confirm_uninstall": "{} ({}) deinstallieren?",
         "ps4_ip": "PS4 IP:",
@@ -1016,7 +1096,7 @@ LOCALE = {
         "ftp_nav_up": "⬆ Nach oben"
     },
     "fr": {
-        "window_title": f"STORM PS4 PKG SENDER v{CURRENT_VERSION}",
+        "window_title": f"STORM PS4 PKG SENDER {CURRENT_VERSION}",
         "confirm_uninstall": "Confirmer la désinstallation",
         "msg_confirm_uninstall": "Désinstaller {} ({}) ?",
         "ps4_ip": "IP PS4 :",
@@ -1249,7 +1329,7 @@ LOCALE = {
         "ftp_nav_up": "⬆ Dossier parent"
     },
     "zh": {
-        "window_title": f"STORM PS4 PKG SENDER v{CURRENT_VERSION}",
+        "window_title": f"STORM PS4 PKG SENDER {CURRENT_VERSION}",
         "confirm_uninstall": "确认卸载",
         "msg_confirm_uninstall": "确定卸载 {} ({}) 吗？",
         "ps4_ip": "PS4 IP:",
@@ -1482,7 +1562,7 @@ LOCALE = {
         "ftp_nav_up": "⬆ 上级目录"
     },
     "ja": {
-        "window_title": f"STORM PS4 PKG SENDER v{CURRENT_VERSION}",
+        "window_title": f"STORM PS4 PKG SENDER {CURRENT_VERSION}",
         "confirm_uninstall": "アンインストールの確認",
         "msg_confirm_uninstall": "{} ({}) をアンインストールしますか？",
         "ps4_ip": "PS4 IP:",
@@ -2899,31 +2979,40 @@ class UpdateDialog(QDialog):
         except Exception as e: QMessageBox.critical(self, "Update Error", str(e)); self.reject()
 
 class FirmwareSelectDialog(QDialog):
-    def __init__(self, parent=None, settings=None):
+    def __init__(self, parent=None, settings=None, lang=None):
         super().__init__(parent)
-        self.setWindowTitle("Firmware Selection")
-        self.setFixedWidth(400)
         self.settings = settings
+        if lang:
+            self.lang = lang
+        elif settings and settings.value("language"):
+            self.lang = settings.value("language")
+        else:
+            self.lang = detect_system_language()
+        
+        icon = get_app_icon()
+        if not icon.isNull():
+            self.setWindowIcon(icon)
+            
+        self.setFixedWidth(420)
         self.init_ui()
 
     def init_ui(self):
         layout = QVBoxLayout(self)
         
-        # Localization
-        lang = self.settings.value("language", "en")
-        if lang == "ru":
-           t_title = "Выбор версии прошивки"
-           t_lbl = "Пожалуйста, выберите версию прошивки (целевая):"
-           t_chk = "Больше не показывать"
-        else:
-           t_title = "Firmware Selection"
-           t_lbl = "Please select your firmware version (target):"
-           t_chk = "Do not show again"
-           
+        # 6 Languages Localization
+        fw_loc = {
+            "ru": ("Выбор версии прошивки", "Пожалуйста, выберите целевую версию системного ПО:", "Больше не показывать", "ОК"),
+            "en": ("Firmware Selection", "Please select your target console firmware version:", "Do not show again", "OK"),
+            "de": ("Firmware-Auswahl", "Bitte wählen Sie die Ziel-Firmware-Version der Konsole:", "Nicht mehr anzeigen", "OK"),
+            "fr": ("Sélection du firmware", "Veuillez sélectionner la version cible du firmware :", "Ne plus afficher", "OK"),
+            "zh": ("固件版本选择", "请选择目标主机系统固件版本：", "不再提示", "确定"),
+            "ja": ("ファームウェア選択", "ターゲットコンソールのファームウェアを選択してください:", "今後このメッセージを表示しない", "OK"),
+        }
+        t_title, t_lbl, t_chk, t_btn = fw_loc.get(self.lang, fw_loc["ru"])
         self.setWindowTitle(t_title)
         
         lbl = QLabel(t_lbl)
-        lbl.setStyleSheet("font-size: 14px; font-weight: bold;")
+        lbl.setStyleSheet("font-size: 13px; font-weight: bold; margin-bottom: 4px;")
         layout.addWidget(lbl)
         
         self.fw_combo = QComboBox()
@@ -2931,34 +3020,40 @@ class FirmwareSelectDialog(QDialog):
         layout.addWidget(self.fw_combo)
         
         # Load saved selection if exists
-        saved_fw = self.settings.value("my_firmware", "")
+        saved_fw = self.settings.value("my_firmware", "") if self.settings else ""
         if saved_fw:
              idx = self.fw_combo.findText(saved_fw)
              if idx >= 0: self.fw_combo.setCurrentIndex(idx)
         
         self.chk_dont_show = QCheckBox(t_chk)
         self.chk_dont_show.setStyleSheet("""
-            QCheckBox { background-color: #d4efdf; padding: 5px; border-radius: 4px; color: #1e8449; font-weight: bold; }
-            QCheckBox::indicator { width: 15px; height: 15px; }
+            QCheckBox { background-color: #d4efdf; padding: 6px; border-radius: 4px; color: #1e8449; font-weight: bold; }
+            QCheckBox::indicator { width: 16px; height: 16px; }
         """)
         layout.addWidget(self.chk_dont_show)
         
         btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok)
-        if lang == "ru":
-             btns.button(QDialogButtonBox.StandardButton.Ok).setText("ОК")
+        ok_btn = btns.button(QDialogButtonBox.StandardButton.Ok)
+        if ok_btn:
+            ok_btn.setText(t_btn)
+            ok_btn.setMinimumWidth(80)
         btns.accepted.connect(self.save_and_close)
         layout.addWidget(btns)
 
     def save_and_close(self):
         fw = self.fw_combo.currentText()
-        self.settings.setValue("my_firmware", fw)
-        if self.chk_dont_show.isChecked():
-            self.settings.setValue("suppress_fw_dialog", True)
+        if self.settings:
+            self.settings.setValue("my_firmware", fw)
+            if self.chk_dont_show.isChecked():
+                self.settings.setValue("suppress_fw_dialog", True)
         self.accept()
 
 class BackupDialog(QDialog):
     def __init__(self, parent=None, settings=None):
         super().__init__(parent)
+        icon = get_app_icon()
+        if not icon.isNull():
+            self.setWindowIcon(icon)
         self.setWindowTitle(LOCALE[parent.current_lang]["bkp_title"])
         self.setFixedWidth(550) 
         self.settings = settings
@@ -3636,40 +3731,31 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         # hide_console()  # Disabled per user request
-        self.settings = QSettings("StormApp", "STORM_v1215")
+        self.settings = QSettings("STORM SOFT", "STORM PS4 PKG SENDER")
         # Language Detection & Initialization (System Language on first run)
-        def detect_system_language():
-            try:
-                sys_locale = QLocale.system().name().lower()
-                if sys_locale.startswith(("ru", "be", "uk", "kk")):
-                    return "ru"
-                elif sys_locale.startswith("de"):
-                    return "de"
-                elif sys_locale.startswith("fr"):
-                    return "fr"
-                elif sys_locale.startswith("zh"):
-                    return "zh"
-                elif sys_locale.startswith("ja"):
-                    return "ja"
-            except Exception:
-                pass
-            return "en"
-
+        sys_lang = detect_system_language()
         saved_lang = self.settings.value("language", None)
         if saved_lang and saved_lang in LOCALE:
             self.current_lang = saved_lang
         else:
-            self.current_lang = detect_system_language()
+            self.current_lang = sys_lang
+            self.settings.setValue("language", self.current_lang)
+
+        # Clear legacy registry entry if it was set to non-system Asian language
+        try:
+            old_s = QSettings("StormApp", "STORM_v1215")
+            if old_s.value("language") in ("ja", "zh") and sys_lang == "ru":
+                old_s.setValue("language", "ru")
+        except Exception:
+            pass
+
         self.setWindowTitle(LOCALE[self.current_lang]["window_title"])
         self.item_by_key = {}
         
-        try:
-            icon_path = resource_path("stormps4pkgsender.ico")
-            if not os.path.exists(icon_path):
-                icon_path = resource_path("stormps4pkgsender.png")
-            if os.path.exists(icon_path):
-                self.setWindowIcon(QIcon(icon_path))
-        except Exception as e: pass
+        # Universal Application Icon
+        icon = get_app_icon()
+        if not icon.isNull():
+            self.setWindowIcon(icon)
         
         self.setAcceptDrops(True)
         
@@ -3774,7 +3860,7 @@ class MainWindow(QMainWindow):
 
     def check_firmware_dialog(self, force=False):
         if force or not self.settings.value("suppress_fw_dialog", False, type=bool):
-            dlg = FirmwareSelectDialog(self, self.settings)
+            dlg = FirmwareSelectDialog(self, self.settings, lang=self.current_lang)
             if dlg.exec() == QDialog.DialogCode.Accepted:
                  # Refresh settings UI if visible
                  if hasattr(self, 'lbl_my_fw'):
@@ -5928,13 +6014,13 @@ class MainWindow(QMainWindow):
 
     def force_taskbar_icon(self):
         try:
-            icon_path = resource_path("stormps4pkgsender.ico")
-            if not os.path.exists(icon_path): return
+            icon_path = get_app_icon_path()
+            if not icon_path or not os.path.exists(icon_path): return
             hwnd = int(self.winId())
             h_icon = ctypes.windll.user32.LoadImageW(0, icon_path, 1, 0, 0, 0x00000010 | 0x00008000) 
             if h_icon:
-                ctypes.windll.user32.SendMessageW(hwnd, 0x80, 1, h_icon)
-                ctypes.windll.user32.SendMessageW(hwnd, 0x80, 0, h_icon)
+                ctypes.windll.user32.SendMessageW(hwnd, 0x80, 1, h_icon) # WM_SETICON ICON_BIG
+                ctypes.windll.user32.SendMessageW(hwnd, 0x80, 0, h_icon) # WM_SETICON ICON_SMALL
         except: pass
 
     # --- PING & CONNECTION LOGIC ---
@@ -9063,8 +9149,9 @@ if __name__ == "__main__":
     if not acquire_single_instance():
         sys.exit(0)
     app = QApplication(sys.argv)
-    ico_path = resource_path("stormps4pkgsender.ico")
-    if os.path.exists(ico_path): app_icon = QIcon(ico_path); app.setWindowIcon(app_icon)
+    app_icon = get_app_icon()
+    if not app_icon.isNull():
+        app.setWindowIcon(app_icon)
     app.setApplicationName("STORM PS4 PKG SENDER")
     app.setStyle("Fusion")
     
