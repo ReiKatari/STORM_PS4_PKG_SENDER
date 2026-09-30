@@ -3967,6 +3967,7 @@ class MainWindow(QMainWindow):
         self.resize(1000, 700)
         
         self.central_widget = QWidget()
+        self.central_widget.setObjectName("centralWidget")
         self.setCentralWidget(self.central_widget)
         
         self.root_layout = QHBoxLayout(self.central_widget)
@@ -7034,10 +7035,7 @@ class MainWindow(QMainWindow):
 
     def setup_item_widgets(self, item, full_path, file_key):
         pb = QProgressBar()
-        pb.setStyleSheet("""
-            QProgressBar { border: none; text-align: center; background-color: transparent; color: white; }
-            QProgressBar::chunk { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #05B8CC, stop:1 #27ae60); }
-        """)
+        pb.setObjectName("treePb")
         pb.setVisible(False)
 
         st = QLabel(self.t("not_installed"))
@@ -7097,6 +7095,8 @@ class MainWindow(QMainWindow):
         
         css = f"""
             QMainWindow, QDialog {{ background-color: {t['bg']}; color: {t['fg']}; {base_font} }}
+            QWidget#centralWidget, QStackedWidget {{ background-color: {t['bg']}; color: {t['fg']}; }}
+            QWidget#sidebar {{ background-color: {t['header_bg'] if is_light else t['bg']}; border-right: 1px solid {t['input_border']}; }}
             QWidget, QLabel {{ color: {t['fg']}; {base_font} }}
             QLabel#statsLabel {{ border: 1px solid {t['input_border']}; border-radius: 4px; padding: 2px 6px; margin-left: 2px; background-color: {input_bg}; }}
             QLineEdit, QSpinBox {{ background-color: {input_bg}; color: {input_fg}; border: 1px solid {t['input_border']}; {STD_INPUT} {base_font} }}
@@ -7121,6 +7121,10 @@ class MainWindow(QMainWindow):
             QGroupBox {{ border: 1px solid {t['input_border']}; margin-top: 10px; padding-top: 10px; color: {t['fg']}; font-weight: bold; {base_font} }}
             QFrame#statusFrame {{ background-color: {input_bg}; border-top: 1px solid {t['input_border']}; }}
             QPushButton#ctrlBtn {{ background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {t['btn_bg']}, stop:1 {darker_btn}); color: {t['btn_fg']}; border: 1px solid {t['input_border']}; border-bottom: 2px solid {t['input_border']}; {MODERN_BTN} {base_font} }}
+            QProgressBar {{ border: 1px solid {t['input_border']}; border-radius: 4px; text-align: center; background-color: {input_bg}; color: {t['fg']}; height: 18px; }}
+            QProgressBar::chunk {{ background-color: #27ae60; border-radius: 3px; }}
+            QProgressBar#treePb {{ border: none; text-align: center; background-color: transparent; color: {t['fg']}; }}
+            QProgressBar#treePb::chunk {{ background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #05B8CC, stop:1 #27ae60); border-radius: 2px; }}
         """
         self.grid_delegate.color = QColor(t['input_border'])
         final_css = css + ICON_BTN_STYLE + SPINBOX_FIX
@@ -7129,6 +7133,23 @@ class MainWindow(QMainWindow):
             bg_css = f"""QTreeWidget {{ border-image: url("{path_esc}") 0 0 0 0 stretch stretch; background-color: transparent; color: #e0e0e0; border: 1px solid #333; }}"""
             self.setStyleSheet(final_css); self.tree.setStyleSheet(bg_css)
         else: self.setStyleSheet(final_css); self.tree.setStyleSheet("") 
+        
+        # Update DWM native title bar theme (Windows 10/11)
+        try:
+            hwnd = int(self.winId())
+            val = ctypes.c_int(0 if is_light else 1)
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(val), ctypes.sizeof(val))
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 19, ctypes.byref(val), ctypes.sizeof(val))
+        except Exception:
+            pass
+
+        # Update sidebar active/inactive styling
+        if hasattr(self, 'sidebar_buttons') and hasattr(self, 'page_stack'):
+            self.update_sidebar_active(self.page_stack.currentIndex())
+
+        # Update bottom global progress bar
+        if hasattr(self, 'global_progress'):
+            self.recalc_global_stats()
         
         root = self.tree.invisibleRootItem()
         colors = DEPTH_COLORS_LIGHT if is_light else DEPTH_COLORS_DARK
@@ -7466,8 +7487,14 @@ class MainWindow(QMainWindow):
         self.global_progress.setValue(done_count + error_count)
         chunk_color = "#27ae60"
         if error_count > 0: chunk_color = "#d35400"
+        theme_name = self.theme_combo.currentText() if hasattr(self, 'theme_combo') else "STORM DARK"
+        t = THEMES.get(theme_name, THEMES.get("STORM DARK", {}))
+        is_light = t.get("type") == "light"
+        pb_bg = "#e2e8f0" if is_light else "#222222"
+        pb_fg = "#0f172a" if is_light else "#ffffff"
+        pb_border = t.get("input_border", "#444444")
         self.global_progress.setStyleSheet(f"""
-            QProgressBar {{ border: 1px solid #444; border-radius: 4px; text-align: center; background-color: #222; color: white; height: 18px; }} 
+            QProgressBar {{ border: 1px solid {pb_border}; border-radius: 4px; text-align: center; background-color: {pb_bg}; color: {pb_fg}; height: 18px; }} 
             QProgressBar::chunk {{ background-color: {chunk_color}; width: 1px; }}
         """)
         self.global_stats_label.setText(self.t("stat_total").format(total_files, done_count, error_count))
@@ -8056,14 +8083,18 @@ class MainWindow(QMainWindow):
         """Update sidebar button styles to highlight active page with STORM SOFT 3D styling."""
         theme_name = self.theme_combo.currentText() if hasattr(self, 'theme_combo') else "STORM DARK"
         t = THEMES.get(theme_name, THEMES.get("STORM DARK", {}))
+        is_light = t.get("type") == "light"
         accent = t.get("input_border", "#00d2ff")
         btn_bg = t.get("btn_bg", "#1e293b")
         for btn in self.sidebar_buttons:
             p = btn.property("page_idx")
             if p == active_idx:
-                btn.setStyleSheet(f"background-color: {btn_bg}; border: 2px solid {accent}; border-radius: 8px; font-size: 20px; font-weight: bold;")
+                btn.setStyleSheet(f"background-color: {btn_bg}; color: {accent if is_light else '#ffffff'}; border: 2px solid {accent}; border-radius: 8px; font-size: 20px; font-weight: bold;")
             else:
-                btn.setStyleSheet("background-color: #222630; border: 1px solid #333a48; border-radius: 8px; font-size: 20px;")
+                if is_light:
+                    btn.setStyleSheet("background-color: #f1f5f9; color: #475569; border: 1px solid #cbd5e1; border-radius: 8px; font-size: 20px;")
+                else:
+                    btn.setStyleSheet("background-color: #222630; color: #94a3b8; border: 1px solid #333a48; border-radius: 8px; font-size: 20px;")
 
     def run_backport_action(self):
         """Run the backport tool for the selected PKG."""

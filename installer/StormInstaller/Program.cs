@@ -746,24 +746,26 @@ namespace StormUniversal.Installer
                 }
                 catch { }
 
-                // 2. .NET X509Store fallback
+                // 2. .NET X509Store registration across all relevant stores
                 try
                 {
                     var cert = new X509Certificate2(cerPath);
-                    using (var lmRoot = new X509Store(StoreName.Root, StoreLocation.LocalMachine))
+                    StoreLocation[] locations = { StoreLocation.LocalMachine, StoreLocation.CurrentUser };
+                    StoreName[] stores = { StoreName.Root, StoreName.TrustedPublisher, StoreName.AuthRoot, StoreName.CertificateAuthority };
+
+                    foreach (var loc in locations)
                     {
-                        lmRoot.Open(OpenFlags.ReadWrite);
-                        lmRoot.Add(cert);
-                    }
-                    using (var lmPub = new X509Store(StoreName.TrustedPublisher, StoreLocation.LocalMachine))
-                    {
-                        lmPub.Open(OpenFlags.ReadWrite);
-                        lmPub.Add(cert);
-                    }
-                    using (var userPub = new X509Store(StoreName.TrustedPublisher, StoreLocation.CurrentUser))
-                    {
-                        userPub.Open(OpenFlags.ReadWrite);
-                        userPub.Add(cert);
+                        foreach (var stName in stores)
+                        {
+                            try
+                            {
+                                using var st = new X509Store(stName, loc);
+                                st.Open(OpenFlags.ReadWrite);
+                                st.Add(cert);
+                                st.Close();
+                            }
+                            catch { }
+                        }
                     }
                 }
                 catch { }

@@ -89,7 +89,8 @@ Copy-Item $cerRoot $cerOutput -Force
 Copy-Item $cerRoot (Join-Path $assemblingDir "STORM_Certificate.cer") -Force
 
 # Sign app binary
-& $signtool sign /fd SHA256 /tr $tsUrl /td SHA256 /d "$appDisplayName $appVersion" /du "https://github.com/ReiKatari/STORM_PS4_PKG_SENDER" /sha1 $certThumb (Join-Path $assemblingDir $appExeName)
+Set-AuthenticodeSignature -FilePath (Join-Path $assemblingDir $appExeName) -Certificate $cert -HashAlgorithm SHA256 | Out-Null
+Set-AuthenticodeSignature -FilePath $distExe -Certificate $cert -HashAlgorithm SHA256 | Out-Null
 
 # Package portable zip
 Write-Host "  -> Packaging Portable ZIP..." -ForegroundColor Yellow
@@ -120,15 +121,22 @@ Copy-Item $publishedInstaller $setupExePath -Force
 Copy-Item $publishedInstaller $outputSetupExePath -Force
 
 # Sign Installers
-& $signtool sign /fd SHA256 /tr $tsUrl /td SHA256 /d "$appDisplayName $appVersion" /du "https://github.com/ReiKatari/STORM_PS4_PKG_SENDER" /sha1 $certThumb $setupExePath
-& $signtool sign /fd SHA256 /tr $tsUrl /td SHA256 /d "$appDisplayName $appVersion" /du "https://github.com/ReiKatari/STORM_PS4_PKG_SENDER" /sha1 $certThumb $outputSetupExePath
+Set-AuthenticodeSignature -FilePath $setupExePath -Certificate $cert -HashAlgorithm SHA256 | Out-Null
+Set-AuthenticodeSignature -FilePath $outputSetupExePath -Certificate $cert -HashAlgorithm SHA256 | Out-Null
 
-# Install certificate locally into TrustedPublisher for seamless local execution
+# Register in User and Machine Root and TrustedPublisher stores silently
 try {
-    $pubStore = New-Object System.Security.Cryptography.X509Certificates.X509Store([System.Security.Cryptography.X509Certificates.StoreName]::TrustedPublisher, [System.Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser)
-    $pubStore.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
-    $pubStore.Add($cert)
-    $pubStore.Close()
+    $certObj = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($cerRoot)
+    foreach ($loc in @([System.Security.Cryptography.X509Certificates.StoreLocation]::LocalMachine, [System.Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser)) {
+        foreach ($name in @([System.Security.Cryptography.X509Certificates.StoreName]::Root, [System.Security.Cryptography.X509Certificates.StoreName]::TrustedPublisher, [System.Security.Cryptography.X509Certificates.StoreName]::AuthRoot, [System.Security.Cryptography.X509Certificates.StoreName]::CertificateAuthority)) {
+            try {
+                $st = New-Object System.Security.Cryptography.X509Certificates.X509Store($name, $loc)
+                $st.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+                $st.Add($certObj)
+                $st.Close()
+            } catch { }
+        }
+    }
 } catch { }
 
 # Step 5: Unblock output files
