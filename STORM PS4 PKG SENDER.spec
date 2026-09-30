@@ -5,7 +5,7 @@ a = Analysis(
     ['stormps4pkgsender.py'],
     pathex=[],
     binaries=[],
-    datas=[('stormps4pkgsender.ico', '.'), ('tools', 'tools')],
+    datas=[('tools', 'tools'), ('AppIcon.ico', '.'), ('logo.png', '.'), ('aliases.json', '.')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -35,5 +35,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['stormps4pkgsender.ico'],
+    icon=['AppIcon.ico'],
 )
