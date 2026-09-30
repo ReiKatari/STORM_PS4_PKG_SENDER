@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.IO;
+using System.IO.Compression;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography.X509Certificates;
@@ -39,6 +40,7 @@ namespace StormUniversal.Installer
         private CheckBox chkRegister = null!;
         private CheckBox chkInstallCert = null!;
         private CheckBox chkRunAfter = null!;
+        private bool isInstalling = false;
 
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
@@ -70,6 +72,27 @@ namespace StormUniversal.Installer
             InitializeComponent();
         }
 
+        private static GraphicsPath GetRoundedRectPath(Rectangle rect, int radius)
+        {
+            GraphicsPath path = new GraphicsPath();
+            int diameter = radius * 2;
+            Rectangle arc = new Rectangle(rect.Location, new Size(diameter, diameter));
+
+            // top left
+            path.AddArc(arc, 180, 90);
+            // top right
+            arc.X = rect.Right - diameter;
+            path.AddArc(arc, 270, 90);
+            // bottom right
+            arc.Y = rect.Bottom - diameter;
+            path.AddArc(arc, 0, 90);
+            // bottom left
+            arc.X = rect.Left;
+            path.AddArc(arc, 90, 90);
+            path.CloseFigure();
+            return path;
+        }
+
         private void InitializeComponent()
         {
             this.Text = $"{AppDisplayName} — STORM INSTALLER";
@@ -91,6 +114,7 @@ namespace StormUniversal.Installer
             };
             headerPanel.Paint += (s, e) =>
             {
+                // Bottom Cyan Accent Line
                 using var p = new Pen(Color.FromArgb(14, 165, 233), 2f);
                 e.Graphics.DrawLine(p, 0, headerPanel.Height - 1, headerPanel.Width, headerPanel.Height - 1);
             };
@@ -113,7 +137,7 @@ namespace StormUniversal.Installer
                 Location = new Point(24, 49)
             };
 
-            // Top-Right Header Icon (Clean Program Icon, without frames or borders - Rule 4)
+            // Top-Right Header Icon (Clean Program Icon, without frames or borders)
             picHeaderLogo = new PictureBox
             {
                 Location = new Point(548, 16),
@@ -139,7 +163,7 @@ namespace StormUniversal.Installer
                 Size = new Size(576, 350)
             };
 
-            // Red-Black Signature Logo in Body (Clean, without frames/borders, directly below header icon - Rule 4)
+            // Red-Black Signature Logo in Body (Clean, without frames/borders, directly below header icon)
             var picBodyLogo = new PictureBox
             {
                 Location = new Point(524, 10),
@@ -154,8 +178,9 @@ namespace StormUniversal.Installer
                 var asm = Assembly.GetExecutingAssembly();
                 foreach (var name in asm.GetManifestResourceNames())
                 {
-                    if (name.EndsWith("logo.png", StringComparison.OrdinalIgnoreCase) ||
-                        name.EndsWith("badge_logo.png", StringComparison.OrdinalIgnoreCase))
+                    if (name.EndsWith("header_badge.png", StringComparison.OrdinalIgnoreCase) ||
+                        name.EndsWith("badge_logo.png", StringComparison.OrdinalIgnoreCase) ||
+                        name.EndsWith("logo.png", StringComparison.OrdinalIgnoreCase))
                     {
                         using var s = asm.GetManifestResourceStream(name);
                         if (s != null)
@@ -220,7 +245,6 @@ namespace StormUniversal.Installer
 
             txtInstallPath = new TextBox
             {
-                // Rule 3: Installation strictly to program name folder WITHOUT version
                 Text = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), AppFolderName),
                 Location = new Point(5, 105),
                 Size = new Size(460, 26),
@@ -345,7 +369,6 @@ namespace StormUniversal.Installer
                 FlatStyle = FlatStyle.Flat,
                 BackColor = Color.FromArgb(30, 41, 59),
                 ForeColor = Color.FromArgb(226, 232, 240),
-                Font = new Font("Segoe UI", 9.5f, FontStyle.Regular),
                 Cursor = Cursors.Hand
             };
             btnCancel.FlatAppearance.BorderColor = Color.FromArgb(51, 65, 85);
@@ -372,32 +395,52 @@ namespace StormUniversal.Installer
 
         private void Mode_CheckedChanged(object? sender, EventArgs e)
         {
+            if (isInstalling) return;
             if (rbPortable.Checked)
             {
                 txtInstallPath.Text = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, $"{AppFolderName}_Portable");
                 chkDesktop.Checked = false;
-                chkDesktop.Enabled = false;
+                chkDesktop.AutoCheck = false;
+                chkDesktop.ForeColor = Color.FromArgb(100, 116, 139);
+                chkDesktop.Cursor = Cursors.Default;
+
                 chkStartMenu.Checked = false;
-                chkStartMenu.Enabled = false;
+                chkStartMenu.AutoCheck = false;
+                chkStartMenu.ForeColor = Color.FromArgb(100, 116, 139);
+                chkStartMenu.Cursor = Cursors.Default;
+
                 chkRegister.Checked = false;
-                chkRegister.Enabled = false;
+                chkRegister.AutoCheck = false;
+                chkRegister.ForeColor = Color.FromArgb(100, 116, 139);
+                chkRegister.Cursor = Cursors.Default;
+
                 btnInstall.Text = "📦  Распаковать";
             }
             else
             {
                 txtInstallPath.Text = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), AppFolderName);
                 chkDesktop.Checked = true;
-                chkDesktop.Enabled = true;
+                chkDesktop.AutoCheck = true;
+                chkDesktop.ForeColor = Color.White;
+                chkDesktop.Cursor = Cursors.Hand;
+
                 chkStartMenu.Checked = true;
-                chkStartMenu.Enabled = true;
+                chkStartMenu.AutoCheck = true;
+                chkStartMenu.ForeColor = Color.White;
+                chkStartMenu.Cursor = Cursors.Hand;
+
                 chkRegister.Checked = true;
-                chkRegister.Enabled = true;
+                chkRegister.AutoCheck = true;
+                chkRegister.ForeColor = Color.White;
+                chkRegister.Cursor = Cursors.Hand;
+
                 btnInstall.Text = "📦  Установить";
             }
         }
 
         private void BtnBrowse_Click(object? sender, EventArgs e)
         {
+            if (isInstalling) return;
             using var fbd = new FolderBrowserDialog();
             fbd.Description = $"Выберите папку для установки {AppDisplayName}:";
             fbd.UseDescriptionForTitle = true;
@@ -409,6 +452,7 @@ namespace StormUniversal.Installer
 
         private async void BtnInstall_Click(object? sender, EventArgs e)
         {
+            if (isInstalling) return;
             progressBar.Visible = true;
             lblStatus.Visible = true;
             await StartInstallationAsync();
@@ -416,18 +460,30 @@ namespace StormUniversal.Installer
 
         private async Task StartInstallationAsync()
         {
-            // Rule 4: On start, Install button disables, Cancel button remains active
+            isInstalling = true;
+
             btnInstall.Enabled = false;
+            btnInstall.BackColor = Color.FromArgb(30, 41, 59);
+            btnInstall.ForeColor = Color.FromArgb(100, 116, 139);
+            btnInstall.FlatAppearance.BorderColor = Color.FromArgb(51, 65, 85);
+            btnInstall.Cursor = Cursors.Default;
+
             btnCancel.Enabled = true;
-            btnBrowse.Enabled = false;
-            rbStandard.Enabled = false;
-            rbPortable.Enabled = false;
-            txtInstallPath.Enabled = false;
-            chkDesktop.Enabled = false;
-            chkStartMenu.Enabled = false;
-            chkInstallCert.Enabled = false;
-            chkRegister.Enabled = false;
-            chkRunAfter.Enabled = false;
+
+            btnBrowse.Cursor = Cursors.Default;
+            btnBrowse.ForeColor = Color.FromArgb(100, 116, 139);
+            btnBrowse.BackColor = Color.FromArgb(20, 28, 40);
+            btnBrowse.FlatAppearance.BorderColor = Color.FromArgb(51, 65, 85);
+
+            rbStandard.AutoCheck = false;
+            rbPortable.AutoCheck = false;
+            txtInstallPath.ReadOnly = true;
+
+            chkDesktop.AutoCheck = false;
+            chkStartMenu.AutoCheck = false;
+            chkInstallCert.AutoCheck = false;
+            chkRegister.AutoCheck = false;
+            chkRunAfter.AutoCheck = false;
 
             try
             {
@@ -439,48 +495,107 @@ namespace StormUniversal.Installer
 
                 Directory.CreateDirectory(targetDir);
 
+                // Terminate any running instances
                 lblStatus.Text = "Завершение предыдущих процессов программы...";
                 progressBar.Value = 10;
                 await Task.Delay(150);
 
-                KillRunningProcesses();
+                foreach (var p in Process.GetProcessesByName("STORM PS4 PKG SENDER"))
+                {
+                    try { p.Kill(); p.WaitForExit(1500); } catch { }
+                }
+                foreach (var p in Process.GetProcessesByName("stormps4pkgsender"))
+                {
+                    try { p.Kill(); p.WaitForExit(1500); } catch { }
+                }
 
                 string targetExe = Path.Combine(targetDir, ExeName);
                 string targetCer = Path.Combine(targetDir, "STORM_Certificate.cer");
                 string targetIco = Path.Combine(targetDir, IcoName);
                 string targetLogo = Path.Combine(targetDir, "logo.png");
 
+                if (!Directory.Exists(targetDir))
+                {
+                    Directory.CreateDirectory(targetDir);
+                }
+
                 if (chkInstallCert.Checked)
                 {
-                    lblStatus.Text = "Регистрация доверенного сертификата...";
+                    lblStatus.Text = "Регистрация доверенного сертификата (Root и Publisher)...";
                     progressBar.Value = 25;
                     await Task.Delay(150);
 
-                    try
+                    ExtractResource("STORM_Certificate.cer", targetCer);
+                    if (File.Exists(targetCer))
                     {
-                        ExtractResource("STORM_Certificate.cer", targetCer);
-                        if (File.Exists(targetCer))
-                        {
-                            InstallCertificateSilently(targetCer);
-                        }
+                        InstallCertificateSilently(targetCer);
                     }
-                    catch { }
                 }
 
-                lblStatus.Text = $"Распаковка пакета {AppDisplayName} (v{AppVersion})...";
-                progressBar.Value = 45;
+                lblStatus.Text = $"Распаковка пакета {AppDisplayName} ({AppVersion})...";
+                progressBar.Value = 35;
                 await Task.Delay(100);
 
-                ExtractResource(ExeName, targetExe);
-                try { ExtractResource(IcoName, targetIco); } catch { }
-                try { ExtractResource("logo.png", targetLogo); } catch { }
+                // Extract Zip Package
+                await Task.Run(() =>
+                {
+                    var asm = Assembly.GetExecutingAssembly();
+                    foreach (var name in asm.GetManifestResourceNames())
+                    {
+                        if (name.EndsWith("Payload.zip", StringComparison.OrdinalIgnoreCase) || name.EndsWith("publish.zip", StringComparison.OrdinalIgnoreCase))
+                        {
+                            using var stream = asm.GetManifestResourceStream(name);
+                            if (stream != null)
+                            {
+                                using var zip = new ZipArchive(stream, ZipArchiveMode.Read);
+                                int total = zip.Entries.Count;
+                                int count = 0;
+                                foreach (var entry in zip.Entries)
+                                {
+                                    count++;
+                                    string destPath = Path.Combine(targetDir, entry.FullName);
+                                    if (string.IsNullOrEmpty(entry.Name))
+                                    {
+                                        Directory.CreateDirectory(destPath);
+                                        continue;
+                                    }
 
-                // Extract Tools directory
-                ExtractAllToolFiles(targetDir);
+                                    string? parent = Path.GetDirectoryName(destPath);
+                                    if (!string.IsNullOrEmpty(parent)) Directory.CreateDirectory(parent);
 
-                progressBar.Value = 75;
+                                    if (File.Exists(destPath))
+                                    {
+                                        try
+                                        {
+                                            File.SetAttributes(destPath, FileAttributes.Normal);
+                                            File.Delete(destPath);
+                                        }
+                                        catch { }
+                                    }
+
+                                    entry.ExtractToFile(destPath, true);
+                                    UnblockFile(destPath);
+
+                                    int percent = 35 + (int)((double)count / total * 45);
+                                    this.Invoke((System.Windows.Forms.MethodInvoker)delegate
+                                    {
+                                        if (percent <= 80) progressBar.Value = percent;
+                                    });
+                                }
+                            }
+                            break;
+                        }
+                    }
+                });
+
+                ExtractResource(IcoName, targetIco);
+                ExtractResource("header_badge.png", targetLogo);
+                ExtractResource("STORM_Certificate.cer", targetCer);
+
+                // Self-healing: Unblock files and remove Mark of the Web
                 lblStatus.Text = "Снятие меток блокировки и оптимизация безопасности...";
-                await Task.Delay(150);
+                progressBar.Value = 85;
+                await Task.Delay(100);
 
                 UnblockFile(targetExe);
                 UnblockFile(targetCer);
@@ -491,7 +606,7 @@ namespace StormUniversal.Installer
                 if (rbStandard.Checked)
                 {
                     lblStatus.Text = "Создание системных ярлыков и регистрация в Windows...";
-                    progressBar.Value = 88;
+                    progressBar.Value = 92;
                     await Task.Delay(150);
 
                     CreateShortcuts(targetDir, targetExe, targetIco, chkDesktop.Checked, chkStartMenu.Checked);
@@ -502,17 +617,40 @@ namespace StormUniversal.Installer
                     }
                 }
 
-                // Rule 4: At 100%, both buttons are disabled, installer auto-launches program and closes
                 progressBar.Value = 100;
-                lblStatus.Text = rbPortable.Checked ? "Портативная версия успешно распакована!" : "Установка успешно завершена! Система полностью готова.";
+                lblStatus.Text = rbPortable.Checked ? "Портативная версия успешно распакована и разблокирована!" : "Установка успешно завершена! Система полностью готова.";
                 lblStatus.ForeColor = Color.FromArgb(16, 185, 129);
                 btnInstall.Enabled = false;
+                btnInstall.BackColor = Color.FromArgb(20, 28, 40);
+                btnInstall.ForeColor = Color.FromArgb(80, 95, 115);
                 btnCancel.Enabled = false;
+                btnCancel.BackColor = Color.FromArgb(20, 28, 40);
+                btnCancel.ForeColor = Color.FromArgb(80, 95, 115);
+                btnCancel.Cursor = Cursors.Default;
                 await Task.Delay(500);
 
-                if (chkRunAfter.Checked)
+                if (chkRunAfter.Checked && File.Exists(targetExe))
                 {
-                    TryLaunchApplication(targetExe, targetDir);
+                    try
+                    {
+                        // Запуск через explorer.exe гарантирует нормальный (неповышенный) уровень привилегий (Medium IL),
+                        // что полностью исключает блокировку Drag-and-Drop механизмом UIPI в Windows
+                        Process.Start(new ProcessStartInfo
+                        {
+                            FileName = "explorer.exe",
+                            Arguments = $"\"{targetExe}\"",
+                            UseShellExecute = true
+                        });
+                    }
+                    catch
+                    {
+                        Process.Start(new ProcessStartInfo
+                        {
+                            FileName = targetExe,
+                            WorkingDirectory = targetDir,
+                            UseShellExecute = true
+                        });
+                    }
                 }
 
                 this.Close();
@@ -520,60 +658,34 @@ namespace StormUniversal.Installer
             catch (Exception ex)
             {
                 MessageBox.Show($"Ошибка во время установки:\n{ex.Message}", "Ошибка установки", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                isInstalling = false;
+
                 btnInstall.Enabled = true;
+                btnInstall.BackColor = Color.FromArgb(14, 165, 233);
+                btnInstall.ForeColor = Color.White;
+                btnInstall.FlatAppearance.BorderColor = Color.FromArgb(56, 189, 248);
+                btnInstall.Cursor = Cursors.Hand;
+
                 btnCancel.Enabled = true;
-                btnBrowse.Enabled = true;
-            }
-        }
 
-        private void ExtractAllToolFiles(string targetDir)
-        {
-            string toolsTargetDir = Path.Combine(targetDir, "tools");
-            Directory.CreateDirectory(toolsTargetDir);
+                btnBrowse.Cursor = Cursors.Hand;
+                btnBrowse.ForeColor = Color.FromArgb(14, 165, 233);
+                btnBrowse.BackColor = Color.FromArgb(30, 41, 59);
+                btnBrowse.FlatAppearance.BorderColor = Color.FromArgb(14, 165, 233);
 
-            var asm = Assembly.GetExecutingAssembly();
-            foreach (var name in asm.GetManifestResourceNames())
-            {
-                if (name.Contains(".tools.", StringComparison.OrdinalIgnoreCase))
+                rbStandard.AutoCheck = true;
+                rbPortable.AutoCheck = true;
+                txtInstallPath.ReadOnly = false;
+
+                if (rbStandard.Checked)
                 {
-                    int idx = name.IndexOf(".tools.", StringComparison.OrdinalIgnoreCase);
-                    string relPath = name.Substring(idx + 7);
-                    
-                    string fullOutPath = Path.Combine(toolsTargetDir, relPath);
-                    string? dir = Path.GetDirectoryName(fullOutPath);
-                    if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
-
-                    using var s = asm.GetManifestResourceStream(name);
-                    if (s != null)
-                    {
-                        using var fs = new FileStream(fullOutPath, FileMode.Create, FileAccess.Write);
-                        s.CopyTo(fs);
-                    }
+                    chkDesktop.AutoCheck = true;
+                    chkStartMenu.AutoCheck = true;
+                    chkRegister.AutoCheck = true;
                 }
+                chkInstallCert.AutoCheck = true;
+                chkRunAfter.AutoCheck = true;
             }
-        }
-
-        private static void TryLaunchApplication(string directExePath, string workingDir)
-        {
-            try
-            {
-                if (File.Exists(directExePath))
-                {
-                    UnblockFile(directExePath);
-                    try
-                    {
-                        Process.Start(new ProcessStartInfo
-                        {
-                            FileName = directExePath,
-                            WorkingDirectory = workingDir,
-                            UseShellExecute = true
-                        });
-                        return;
-                    }
-                    catch { }
-                }
-            }
-            catch { }
         }
 
         public static void UnblockFile(string path)
@@ -588,203 +700,185 @@ namespace StormUniversal.Installer
             catch { }
         }
 
-        public static void UnblockEntireDirectory(string dirPath)
+        public static void UnblockEntireDirectory(string dir)
         {
             try
             {
-                if (Directory.Exists(dirPath))
+                if (!Directory.Exists(dir)) return;
+                foreach (var file in Directory.GetFiles(dir, "*.*", SearchOption.AllDirectories))
                 {
-                    foreach (var file in Directory.GetFiles(dirPath, "*.*", SearchOption.AllDirectories))
+                    UnblockFile(file);
+                }
+            }
+            catch { }
+        }
+
+        public static void InstallCertificateSilently(string cerPath)
+        {
+            try
+            {
+                if (!File.Exists(cerPath)) return;
+
+                // 1. Direct certutil command (fastest and most reliable on Windows)
+                try
+                {
+                    var psiRoot = new ProcessStartInfo
                     {
-                        UnblockFile(file);
+                        FileName = "certutil.exe",
+                        Arguments = $"-addstore -f \"Root\" \"{cerPath}\"",
+                        UseShellExecute = false,
+                        CreateNoWindow = true,
+                        WindowStyle = ProcessWindowStyle.Hidden
+                    };
+                    using var p1 = Process.Start(psiRoot);
+                    p1?.WaitForExit(5000);
+
+                    var psiPub = new ProcessStartInfo
+                    {
+                        FileName = "certutil.exe",
+                        Arguments = $"-addstore -f \"TrustedPublisher\" \"{cerPath}\"",
+                        UseShellExecute = false,
+                        CreateNoWindow = true,
+                        WindowStyle = ProcessWindowStyle.Hidden
+                    };
+                    using var p2 = Process.Start(psiPub);
+                    p2?.WaitForExit(5000);
+                }
+                catch { }
+
+                // 2. .NET X509Store fallback
+                try
+                {
+                    var cert = new X509Certificate2(cerPath);
+                    using (var lmRoot = new X509Store(StoreName.Root, StoreLocation.LocalMachine))
+                    {
+                        lmRoot.Open(OpenFlags.ReadWrite);
+                        lmRoot.Add(cert);
+                    }
+                    using (var lmPub = new X509Store(StoreName.TrustedPublisher, StoreLocation.LocalMachine))
+                    {
+                        lmPub.Open(OpenFlags.ReadWrite);
+                        lmPub.Add(cert);
+                    }
+                    using (var userPub = new X509Store(StoreName.TrustedPublisher, StoreLocation.CurrentUser))
+                    {
+                        userPub.Open(OpenFlags.ReadWrite);
+                        userPub.Add(cert);
+                    }
+                }
+                catch { }
+            }
+            catch { }
+        }
+
+        private void ExtractResource(string resNameEnding, string targetPath)
+        {
+            try
+            {
+                string? dir = Path.GetDirectoryName(targetPath);
+                if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+                {
+                    Directory.CreateDirectory(dir);
+                }
+                var asm = Assembly.GetExecutingAssembly();
+                foreach (var name in asm.GetManifestResourceNames())
+                {
+                    if (name.EndsWith(resNameEnding, StringComparison.OrdinalIgnoreCase))
+                    {
+                        using var inStream = asm.GetManifestResourceStream(name);
+                        if (inStream != null)
+                        {
+                            using var outStream = File.Create(targetPath);
+                            inStream.CopyTo(outStream);
+                        }
+                        return;
                     }
                 }
             }
             catch { }
         }
 
-        private static void KillRunningProcesses()
-        {
-            string[] procNames = { "STORM PS4 PKG SENDER", "stormps4pkgsender", "ps4_pkg_sender" };
-            foreach (var pName in procNames)
-            {
-                try
-                {
-                    foreach (var p in Process.GetProcessesByName(pName))
-                    {
-                        try
-                        {
-                            p.Kill();
-                            p.WaitForExit(1000);
-                        }
-                        catch { }
-                    }
-                }
-                catch { }
-            }
-        }
-
-        private static void ExtractResource(string resSubname, string targetPath)
-        {
-            var asm = Assembly.GetExecutingAssembly();
-            string? foundName = null;
-            foreach (var name in asm.GetManifestResourceNames())
-            {
-                if (name.EndsWith(resSubname, StringComparison.OrdinalIgnoreCase))
-                {
-                    foundName = name;
-                    break;
-                }
-            }
-
-            if (foundName == null) return;
-
-            string? dir = Path.GetDirectoryName(targetPath);
-            if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
-
-            using var s = asm.GetManifestResourceStream(foundName);
-            if (s == null) return;
-
-            using var fs = new FileStream(targetPath, FileMode.Create, FileAccess.Write);
-            s.CopyTo(fs);
-        }
-
-        private static void InstallCertificateSilently(string certPath)
+        private void CreateShortcuts(string targetDir, string targetExe, string targetIco, bool desktopShortcut, bool startMenuShortcut)
         {
             try
             {
-                var cert = new X509Certificate2(certPath);
-                using (var store = new X509Store(StoreName.Root, StoreLocation.LocalMachine))
-                {
-                    store.Open(OpenFlags.ReadWrite);
-                    store.Add(cert);
-                    store.Close();
-                }
-                using (var store = new X509Store(StoreName.TrustedPublisher, StoreLocation.LocalMachine))
-                {
-                    store.Open(OpenFlags.ReadWrite);
-                    store.Add(cert);
-                    store.Close();
-                }
-            }
-            catch
-            {
-                try
-                {
-                    var cert = new X509Certificate2(certPath);
-                    using (var store = new X509Store(StoreName.Root, StoreLocation.CurrentUser))
-                    {
-                        store.Open(OpenFlags.ReadWrite);
-                        store.Add(cert);
-                        store.Close();
-                    }
-                    using (var store = new X509Store(StoreName.TrustedPublisher, StoreLocation.CurrentUser))
-                    {
-                        store.Open(OpenFlags.ReadWrite);
-                        store.Add(cert);
-                        store.Close();
-                    }
-                }
-                catch { }
-            }
-        }
+                Type? shellType = Type.GetTypeFromProgID("WScript.Shell");
+                if (shellType == null) return;
+                dynamic? shell = Activator.CreateInstance(shellType);
+                if (shell == null) return;
 
-        private static void CreateShortcuts(string targetDir, string exePath, string icoPath, bool desktop, bool startMenu)
-        {
-            Type? shellType = Type.GetTypeFromProgID("WScript.Shell");
-            if (shellType == null) return;
-
-            dynamic? shell = Activator.CreateInstance(shellType);
-            if (shell == null) return;
-
-            if (desktop)
-            {
-                try
+                // Start Menu shortcut
+                if (startMenuShortcut)
                 {
-                    string deskDir = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
-                    string lnkPath = Path.Combine(deskDir, $"{AppDisplayName}.lnk");
-                    dynamic shortcut = shell.CreateShortcut(lnkPath);
-                    shortcut.TargetPath = exePath;
+                    string startMenu = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Programs), $"{AppDisplayName}.lnk");
+                    dynamic shortcut = shell.CreateShortcut(startMenu);
+                    shortcut.TargetPath = targetExe;
                     shortcut.WorkingDirectory = targetDir;
-                    shortcut.IconLocation = icoPath;
-                    shortcut.Description = $"{AppDisplayName} v{AppVersion}";
+                    shortcut.IconLocation = (File.Exists(targetIco) ? targetIco : targetExe) + ",0";
+                    shortcut.Description = AppDisplayName;
                     shortcut.Save();
                 }
-                catch { }
-            }
 
-            if (startMenu)
-            {
-                try
+                // Desktop shortcut
+                if (desktopShortcut)
                 {
-                    string progDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonPrograms), "STORM SOFT");
-                    Directory.CreateDirectory(progDir);
-                    string lnkPath = Path.Combine(progDir, $"{AppDisplayName}.lnk");
-                    dynamic shortcut = shell.CreateShortcut(lnkPath);
-                    shortcut.TargetPath = exePath;
-                    shortcut.WorkingDirectory = targetDir;
-                    shortcut.IconLocation = icoPath;
-                    shortcut.Description = $"{AppDisplayName} v{AppVersion}";
-                    shortcut.Save();
+                    string desktop = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), $"{AppDisplayName}.lnk");
+                    dynamic deskShortcut = shell.CreateShortcut(desktop);
+                    deskShortcut.TargetPath = targetExe;
+                    deskShortcut.WorkingDirectory = targetDir;
+                    deskShortcut.IconLocation = (File.Exists(targetIco) ? targetIco : targetExe) + ",0";
+                    deskShortcut.Description = AppDisplayName;
+                    deskShortcut.Save();
                 }
-                catch { }
             }
+            catch { }
         }
 
-        private static void RegisterUninstall(string targetDir, string exePath, string icoPath)
+        private void RegisterUninstall(string targetDir, string targetExe, string targetIco)
         {
             try
             {
-                // Create clean Uninstall.bat
-                string uninstBat = Path.Combine(targetDir, "Uninstall.bat");
-                string batContent = $@"@echo off
-taskkill /F /IM ""{ExeName}"" >nul 2>&1
-timeout /t 1 /nobreak >nul
-del /f /q ""{Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), $"{AppDisplayName}.lnk")}"" >nul 2>&1
-rmdir /s /q ""{Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonPrograms), "STORM SOFT")}"" >nul 2>&1
-reg delete ""HKLM\Software\Microsoft\Windows\CurrentVersion\Uninstall\{AppFolderName}"" /f >nul 2>&1
-echo Программа {AppDisplayName} успешно удалена.
-";
-                File.WriteAllText(uninstBat, batContent);
-
-                using var key = Registry.LocalMachine.CreateSubKey($@"Software\Microsoft\Windows\CurrentVersion\Uninstall\{AppFolderName}");
+                using var key = Registry.CurrentUser.CreateSubKey(@"Software\Microsoft\Windows\CurrentVersion\Uninstall\StormPs4PkgSender");
                 if (key != null)
                 {
                     key.SetValue("DisplayName", AppDisplayName);
                     key.SetValue("DisplayVersion", AppVersion);
-                    key.SetValue("Publisher", "ReiKatari");
-                    key.SetValue("DisplayIcon", icoPath);
+                    key.SetValue("Publisher", "STORM TEAM");
+                    key.SetValue("DisplayIcon", File.Exists(targetIco) ? targetIco : targetExe);
                     key.SetValue("InstallLocation", targetDir);
-                    key.SetValue("UninstallString", $"cmd.exe /c \"{uninstBat}\"");
-                    key.SetValue("QuietUninstallString", $"cmd.exe /c \"{uninstBat}\"");
-                    key.SetValue("NoModify", 1, RegistryValueKind.DWord);
-                    key.SetValue("NoRepair", 1, RegistryValueKind.DWord);
+                    key.SetValue("UninstallString", $"cmd.exe /c rmdir /s /q \"{targetDir}\" & del \"%APPDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\*{AppDisplayName}*.lnk\" & del \"%USERPROFILE%\\Desktop\\*{AppDisplayName}*.lnk\"");
                 }
+            }
+            catch { }
+        }
+
+        private static bool IsAdministrator()
+        {
+            try
+            {
+                using var identity = System.Security.Principal.WindowsIdentity.GetCurrent();
+                var principal = new System.Security.Principal.WindowsPrincipal(identity);
+                return principal.IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator);
             }
             catch
             {
-                try
-                {
-                    using var key = Registry.CurrentUser.CreateSubKey($@"Software\Microsoft\Windows\CurrentVersion\Uninstall\{AppFolderName}");
-                    if (key != null)
-                    {
-                        key.SetValue("DisplayName", AppDisplayName);
-                        key.SetValue("DisplayVersion", AppVersion);
-                        key.SetValue("Publisher", "ReiKatari");
-                        key.SetValue("DisplayIcon", icoPath);
-                        key.SetValue("InstallLocation", targetDir);
-                    }
-                }
-                catch { }
+                return false;
             }
         }
-    }
 
-    internal static class Program
-    {
         [STAThread]
-        private static void Main(string[] args)
+        public static void Main()
         {
+            try
+            {
+                string selfExe = Process.GetCurrentProcess().MainModule?.FileName ?? "";
+                if (!string.IsNullOrEmpty(selfExe))
+                {
+                    UnblockFile(selfExe);
+                }
+            }
+            catch { }
+
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             Application.Run(new InstallerForm());

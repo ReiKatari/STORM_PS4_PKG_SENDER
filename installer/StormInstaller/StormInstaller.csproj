@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <ApplicationIcon>..\..\AppIcon.ico</ApplicationIcon>
+    <Version>1.4.0</Version>
+    <AssemblyVersion>1.4.0.0</AssemblyVersion>
+    <FileVersion>1.4.0.0</FileVersion>
+    <AssemblyTitle>STORM PS4 PKG SENDER 1.4.0</AssemblyTitle>
+    <Product>STORM PS4 PKG SENDER 1.4.0</Product>
+    <Title>STORM PS4 PKG SENDER 1.4.0</Title>
+    <Description>STORM PS4 PKG SENDER 1.4.0</Description>
+    <Company>STORM TEAM</Company>
+    <Authors>ReiKatari and STORM TEAM</Authors>
+    <Copyright>Copyright © STORM TEAM 2026</Copyright>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="..\Output\STORM_PS4_PKG_SENDER_1.4.0_win-x64.zip" Link="Payload\Payload.zip" />
+    <EmbeddedResource Include="..\STORM_Certificate.cer" Link="Payload\STORM_Certificate.cer" />
+    <EmbeddedResource Include="..\..\AppIcon.ico" Link="Payload\AppIcon.ico" />
+    <EmbeddedResource Include="header_badge.png" Link="Payload\header_badge.png" />
+  </ItemGroup>
+
+</Project>
